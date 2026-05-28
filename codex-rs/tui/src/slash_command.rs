@@ -44,6 +44,7 @@ pub enum SlashCommand {
     Diff,
     Mention,
     Status,
+    Accounts,
     DebugConfig,
     Title,
     Statusline,
@@ -96,6 +97,7 @@ impl SlashCommand {
             SlashCommand::Skills => "use skills to improve how Codex performs specific tasks",
             SlashCommand::Hooks => "view and manage lifecycle hooks",
             SlashCommand::Status => "show current session configuration and token usage",
+            SlashCommand::Accounts => "choose the active ChatGPT account",
             SlashCommand::DebugConfig => "show config layers and requirement sources for debugging",
             SlashCommand::Title => "configure which items appear in the terminal title",
             SlashCommand::Statusline => "configure which items appear in the status line",
@@ -172,6 +174,7 @@ impl SlashCommand {
                 | SlashCommand::Diff
                 | SlashCommand::Mention
                 | SlashCommand::Status
+                | SlashCommand::Accounts
                 | SlashCommand::Ide
         )
     }
@@ -207,6 +210,7 @@ impl SlashCommand {
             | SlashCommand::Skills
             | SlashCommand::Hooks
             | SlashCommand::Status
+            | SlashCommand::Accounts
             | SlashCommand::DebugConfig
             | SlashCommand::Ps
             | SlashCommand::Stop
@@ -275,6 +279,12 @@ mod tests {
 
     #[test]
     fn certain_commands_are_available_during_task() {
+        assert_eq!(
+            SlashCommand::from_str("accounts"),
+            Ok(SlashCommand::Accounts)
+        );
+        assert!(SlashCommand::Accounts.available_during_task());
+        assert!(SlashCommand::Accounts.available_in_side_conversation());
         assert!(SlashCommand::Goal.available_during_task());
         assert!(SlashCommand::Ide.available_during_task());
         assert!(SlashCommand::Title.available_during_task());

@@ -26,6 +26,7 @@ use std::time::Duration;
 
 use crate::auth::AuthDotJson;
 use crate::auth::load_auth_dot_json;
+use crate::auth::multi_account::AccountsStore;
 use crate::auth::revoke_auth_tokens;
 use crate::auth::save_auth;
 use crate::auth::should_revoke_auth_tokens;
@@ -784,8 +785,9 @@ pub(crate) async fn exchange_code_for_tokens(
     })
 }
 
-/// Persists exchanged credentials using the configured local auth store, then
-/// best-effort revokes any superseded managed ChatGPT tokens.
+/// Persists exchanged credentials using the configured local auth store and
+/// file-backed multi-account index, then best-effort revokes superseded tokens
+/// for the same managed ChatGPT account.
 pub(crate) async fn persist_tokens_async(
     codex_home: &Path,
     api_key: Option<String>,
@@ -823,19 +825,43 @@ pub(crate) async fn persist_tokens_async(
             last_refresh: Some(Utc::now()),
             agent_identity: None,
         };
+        if let Err(err) = AccountsStore::new(codex_home.clone()).upsert_active_auth(auth.clone()) {
+            warn!("failed to save ChatGPT login to accounts.json: {err}");
+        }
         save_auth(&codex_home, &auth, auth_credentials_store_mode)?;
+        if !matches!(
+            auth_credentials_store_mode,
+            AuthCredentialsStoreMode::File | AuthCredentialsStoreMode::Ephemeral
+        ) {
+            save_auth(&codex_home, &auth, AuthCredentialsStoreMode::File)?;
+        }
         Ok::<_, io::Error>((previous_auth, auth))
     })
     .await
     .map_err(|e| io::Error::other(format!("persist task failed: {e}")))??;
 
-    if should_revoke_auth_tokens(previous_auth.as_ref(), &auth)
+    if is_same_managed_chatgpt_account(previous_auth.as_ref(), &auth)
+        && should_revoke_auth_tokens(previous_auth.as_ref(), &auth)
         && let Err(err) = revoke_auth_tokens(previous_auth.as_ref()).await
     {
         warn!("failed to revoke superseded auth tokens after login: {err}");
     }
 
     Ok(())
+}
+
+fn is_same_managed_chatgpt_account(
+    previous_auth: Option<&AuthDotJson>,
+    new_auth: &AuthDotJson,
+) -> bool {
+    let previous_account_id = previous_auth
+        .and_then(|auth| auth.tokens.as_ref())
+        .and_then(|tokens| tokens.account_id.as_deref());
+    let new_account_id = new_auth
+        .tokens
+        .as_ref()
+        .and_then(|tokens| tokens.account_id.as_deref());
+    previous_account_id.is_some() && previous_account_id == new_account_id
 }
 
 fn compose_success_url(
@@ -1193,21 +1219,10 @@ mod tests {
 
     #[serial_test::serial(logout_revoke)]
     #[tokio::test]
-    async fn persist_tokens_async_revokes_previous_auth_without_failing_login() -> anyhow::Result<()>
-    {
+    async fn persist_tokens_async_does_not_revoke_different_account() -> anyhow::Result<()> {
         skip_if_no_network!(Ok(()));
 
         let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/oauth/revoke"))
-            .respond_with(ResponseTemplate::new(500).set_body_json(json!({
-                "error": {
-                    "message": "revoke failed"
-                }
-            })))
-            .expect(1)
-            .mount(&server)
-            .await;
         let _env_guard = EnvGuard::set(
             REVOKE_TOKEN_URL_OVERRIDE_ENV_VAR,
             format!("{}/oauth/revoke", server.uri()),
@@ -1242,6 +1257,53 @@ mod tests {
                 account_id: Some("new-account".to_string()),
             }
         );
+
+        let requests = server
+            .received_requests()
+            .await
+            .context("failed to fetch revoke requests")?;
+        assert_eq!(requests.len(), 0);
+        server.verify().await;
+        Ok(())
+    }
+
+    #[serial_test::serial(logout_revoke)]
+    #[tokio::test]
+    async fn persist_tokens_async_revokes_previous_auth_for_same_account() -> anyhow::Result<()> {
+        skip_if_no_network!(Ok(()));
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/oauth/revoke"))
+            .respond_with(ResponseTemplate::new(500).set_body_json(json!({
+                "error": {
+                    "message": "revoke failed"
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let _env_guard = EnvGuard::set(
+            REVOKE_TOKEN_URL_OVERRIDE_ENV_VAR,
+            format!("{}/oauth/revoke", server.uri()),
+        );
+
+        let codex_home = tempdir()?;
+        save_auth(
+            codex_home.path(),
+            &chatgpt_auth("old-access", "old-refresh", "same-account"),
+            AuthCredentialsStoreMode::File,
+        )?;
+
+        persist_tokens_async(
+            codex_home.path(),
+            /*api_key*/ None,
+            jwt_for_account("same-account"),
+            "new-access".to_string(),
+            "new-refresh".to_string(),
+            AuthCredentialsStoreMode::File,
+        )
+        .await?;
 
         let requests = server
             .received_requests()

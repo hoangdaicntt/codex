@@ -38,6 +38,7 @@ use crate::bottom_pane::ApprovalRequest;
 use crate::bottom_pane::StatusLineItem;
 use crate::bottom_pane::TerminalTitleItem;
 use crate::chatwidget::UserMessage;
+use crate::status::StatusAccountDisplay;
 use codex_app_server_protocol::AskForApproval;
 use codex_config::types::ApprovalsReviewer;
 use codex_features::Feature;
@@ -107,6 +108,14 @@ pub(crate) enum WindowsSandboxEnableMode {
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 pub(crate) struct ConnectorsSnapshot {
     pub(crate) connectors: Vec<AppInfo>,
+}
+
+#[derive(Debug)]
+pub(crate) struct AccountSwitchResult {
+    pub(crate) message: String,
+    pub(crate) status_account_display: Option<StatusAccountDisplay>,
+    pub(crate) plan_type: Option<codex_protocol::account::PlanType>,
+    pub(crate) has_chatgpt_account: bool,
 }
 
 /// Distinguishes why a rate-limit refresh was requested so the completion
@@ -222,6 +231,11 @@ pub(crate) enum AppEvent {
 
     /// Request app-server account logout, then exit after it succeeds.
     Logout,
+
+    /// Result of a `/accounts` account switch request.
+    AccountSwitchFinished {
+        result: Result<AccountSwitchResult, String>,
+    },
 
     /// Request to exit the application due to a fatal error.
     #[allow(dead_code)]

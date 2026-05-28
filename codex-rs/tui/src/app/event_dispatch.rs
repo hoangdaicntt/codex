@@ -315,6 +315,20 @@ impl App {
                         .add_error_message(format!("Logout failed: {err}"));
                 }
             },
+            AppEvent::AccountSwitchFinished { result } => match result {
+                Ok(result) => {
+                    self.chat_widget.update_account_state(
+                        result.status_account_display,
+                        result.plan_type,
+                        result.has_chatgpt_account,
+                    );
+                    self.chat_widget
+                        .add_info_message(result.message, /*hint*/ None);
+                }
+                Err(err) => {
+                    self.chat_widget.add_error_message(err);
+                }
+            },
             AppEvent::FatalExitRequest(message) => {
                 return Ok(AppRunControl::Exit(ExitReason::Fatal(message)));
             }
