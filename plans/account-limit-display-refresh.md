@@ -2,6 +2,7 @@
 
 ## Overview
 Improve the multi-account picker and CLI account selector so switching messages include the selected account email, and account rows show fresh 5h/week usage with reset times for each saved ChatGPT account.
+Also change the default startup update-check behavior so `check_for_update_on_startup` defaults to `false`.
 
 ## Current Project Survey
 - Account rows are rendered by `codex-rs/login/src/auth/multi_account/display.rs`.
@@ -11,11 +12,13 @@ Improve the multi-account picker and CLI account selector so switching messages 
 - Current row limit values read only from `last_limit_state.snapshot`; this is why normal accounts show `-`, because available accounts clear `last_limit_state`.
 - The backend usage endpoint is already wrapped by `codex-backend-client::Client::get_rate_limits_many()`, which calls `/wham/usage` for ChatGPT backend URLs and parses `RateLimitSnapshot`.
 - `codex-backend-client` depends on `codex-login`, so `codex-login` must not depend on `codex-backend-client`. Limit refresh orchestration should live in callers that can depend on both, or use a new lower-level helper with careful dependency direction.
+- `check_for_update_on_startup` currently defaults to `true` in `codex-rs/core/src/config/mod.rs` via `unwrap_or(true)`, and the generated config schema documents that default.
 
 ## Dependencies
 - Prefer adding `codex-backend-client` as a dependency to `codex-cli` and `codex-tui`, since both already depend on `codex-login`.
 - If `Cargo.toml` changes, run `just bazel-lock-update` and `just bazel-lock-check` from the repo root.
 - No new external crates are needed.
+- Changing `check_for_update_on_startup` touches `ConfigToml`/config schema behavior; run `just write-config-schema` from `codex-rs` after implementation.
 
 ## Architecture
 - Keep `accounts.json` as the source of saved account auth data and active account state.
@@ -98,12 +101,19 @@ Improve the multi-account picker and CLI account selector so switching messages 
   - Add or update TUI snapshot coverage for `/accounts` rows showing percent/reset values.
   - Verify no row text overlaps or truncates badly in the selection view.
 
+- [ ] Task 7: Default startup update checks to disabled
+  - Change `codex-rs/core/src/config/mod.rs` so missing `check_for_update_on_startup` resolves to `false`.
+  - Update the config field doc/schema description to say it defaults to `false`.
+  - Run `just write-config-schema` from `codex-rs` to update `core/config.schema.json`.
+  - Add or update config tests covering the default value.
+
 ## Validation
 - Run `just fmt` in `codex-rs`.
 - Run `just fix -p codex-login`, `just fix -p codex-cli`, and `just fix -p codex-tui` if those crates are changed.
 - Run `just test -p codex-login`.
 - Run `just test -p codex-cli`.
 - Run `just test -p codex-tui`; review and accept any intentional `insta` snapshots.
+- Run the relevant config test after changing `check_for_update_on_startup`; if the change is in `codex-core`, run `just test -p codex-core` or a narrower core config test if available.
 - If `Cargo.toml` dependencies change, run `just bazel-lock-update` and `just bazel-lock-check`.
 - Manual checks:
   - `codex accounts` lists each saved account in the two-line format with email, 5h/week percent/reset, compact last-used time, and compact created date.
