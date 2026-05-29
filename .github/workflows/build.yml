@@ -99,12 +99,12 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Build release binary
-        run: cargo build --release -p codex-cli
+      - name: Build binary
+        run: cargo build -p codex-cli
 
       - name: Upload binary
         uses: actions/upload-artifact@v4
         with:
           name: codex-linux
-          path: codex-rs/target/release/codex
+          path: codex-rs/target/debug/codex
           if-no-files-found: error
