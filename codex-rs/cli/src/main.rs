@@ -78,6 +78,7 @@ use codex_login::AuthManager;
 use codex_login::CodexAuth;
 use codex_login::RefreshTokenError;
 use codex_login::auth::multi_account::AccountsStore;
+use codex_login::auth::multi_account::account_id_at_index;
 use codex_login::auth::multi_account::display_rows;
 use codex_login::read_codex_access_token_from_env;
 use codex_memories_write::clear_memory_roots_contents;
@@ -1697,13 +1698,47 @@ async fn run_accounts_command(cmd: AccountsCommand) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    print!("Select account index, or press Enter to keep current: ");
+    print!("Select account index, d <index> to remove, or press Enter to keep current: ");
     std::io::stdout().flush()?;
 
     let mut input = String::new();
     std::io::stdin().read_line(&mut input)?;
     let trimmed = input.trim();
     if trimmed.is_empty() {
+        return Ok(());
+    }
+
+    if let Some(index_text) = trimmed.strip_prefix("d ") {
+        let index: usize = index_text
+            .trim()
+            .parse()
+            .map_err(|_| anyhow::anyhow!("account index must be a positive number"))?;
+        let account_id = account_id_at_index(&accounts_index.accounts, index)?;
+        let outcome = store.remove_account(
+            &account_id,
+            config.cli_auth_credentials_store_mode,
+        )?;
+        auth_manager.reload().await;
+        let removed_email = outcome
+            .removed_account
+            .email
+            .as_deref()
+            .unwrap_or("-");
+        match outcome.new_active_account.as_ref() {
+            Some(active_account) if outcome.active_account_changed => {
+                let active_email = active_account.email.as_deref().unwrap_or("-");
+                println!("Removed account {removed_email}. Active account is now {active_email}.");
+            }
+            Some(_) => {
+                println!("Removed account {removed_email}.");
+            }
+            None if outcome.active_account_changed => {
+                println!("Removed account {removed_email}. No saved ChatGPT accounts.");
+            }
+            None => {
+                println!("Removed account {removed_email}.");
+            }
+        }
         return Ok(());
     }
 

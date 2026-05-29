@@ -119,6 +119,16 @@ pub(crate) struct AccountSwitchResult {
     pub(crate) has_chatgpt_account: bool,
 }
 
+#[derive(Debug)]
+pub(crate) struct AccountRemoveResult {
+    pub(crate) message: String,
+    pub(crate) accounts_index: AccountsIndex,
+    pub(crate) selected_idx: Option<usize>,
+    pub(crate) status_account_display: Option<StatusAccountDisplay>,
+    pub(crate) plan_type: Option<codex_protocol::account::PlanType>,
+    pub(crate) has_chatgpt_account: bool,
+}
+
 /// Distinguishes why a rate-limit refresh was requested so the completion
 /// handler can route the result correctly.
 ///
@@ -238,9 +248,20 @@ pub(crate) enum AppEvent {
         result: Result<AccountSwitchResult, String>,
     },
 
+    /// Progress while refreshing saved accounts for the `/accounts` picker.
+    AccountsPickerLoadProgress {
+        loaded: usize,
+        total: usize,
+    },
+
     /// Result of loading saved accounts for the `/accounts` picker.
     AccountsPickerLoaded {
         result: Result<AccountsIndex, String>,
+    },
+
+    /// Result of deleting an account from the `/accounts` picker.
+    AccountRemoveFinished {
+        result: Result<AccountRemoveResult, String>,
     },
 
     /// Request to exit the application due to a fatal error.

@@ -3,6 +3,8 @@ use chrono::Local;
 use chrono::Utc;
 use codex_protocol::protocol::RateLimitWindow;
 
+use crate::token_data::parse_jwt_expiration;
+
 use super::store::AccountId;
 use super::store::StoredAccount;
 
@@ -54,13 +56,16 @@ fn display_row(
     let marker = if is_active { "* " } else { "  " };
     let email = account.email.as_deref().unwrap_or("-");
     let last_used = format_compact_elapsed(account.last_used_at, now);
+    let token_exp = token_exp_display(account, now);
     let created_at = format_created_at(account.created_at);
     let detail = if account.last_auth_failure.is_some() {
-        format!("   auth failed · used {last_used} · {created_at}")
+        format!("   auth failed · used {last_used} · token exp {token_exp} · {created_at}")
     } else {
         let five_hour = limit_display(account, LimitWindowKind::FiveHour, now);
         let week = limit_display(account, LimitWindowKind::Week, now);
-        format!("   5h {five_hour} · Week {week} · used {last_used} · {created_at}")
+        format!(
+            "   5h {five_hour} · Week {week} · used {last_used} · token exp {token_exp} · {created_at}"
+        )
     };
     let line = format!("{marker}{index}. {email}\n{detail}");
 
@@ -104,13 +109,31 @@ fn limit_display(account: &StoredAccount, kind: LimitWindowKind, now: DateTime<U
 }
 
 fn format_window(window: &RateLimitWindow, now: DateTime<Utc>) -> String {
-    let percent = format!("{:.0}%", window.used_percent);
+    let remaining_percent = (100.0 - window.used_percent).clamp(0.0, 100.0);
+    let percent = format!("{remaining_percent:.0}%");
     let reset = window
         .resets_at
         .and_then(|timestamp| DateTime::from_timestamp(timestamp, 0))
         .map(|timestamp| format_reset_time(timestamp, now))
         .unwrap_or_else(|| "-".to_string());
     format!("{percent}/{reset}")
+}
+
+fn token_exp_display(account: &StoredAccount, now: DateTime<Utc>) -> String {
+    let Some(tokens) = account.auth.tokens.as_ref() else {
+        return "-".to_string();
+    };
+    let Ok(Some(expires_at)) = parse_jwt_expiration(&tokens.access_token) else {
+        return "-".to_string();
+    };
+    if expires_at >= now {
+        format_compact_duration(expires_at.signed_duration_since(now).num_seconds())
+    } else {
+        format!(
+            "-{}",
+            format_compact_duration(now.signed_duration_since(expires_at).num_seconds())
+        )
+    }
 }
 
 fn format_reset_time(timestamp: DateTime<Utc>, now: DateTime<Utc>) -> String {

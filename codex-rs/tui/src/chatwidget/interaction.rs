@@ -17,6 +17,9 @@ impl ChatWidget {
             && !key_hint::ctrl(KeyCode::Char('r')).is_press(key_event)
             && !key_hint::ctrl(KeyCode::Char('u')).is_press(key_event)
         {
+            if self.handle_accounts_picker_delete_key(key_event) {
+                return;
+            }
             self.bottom_pane.handle_key_event(key_event);
             if self.bottom_pane.no_modal_or_popup_active() {
                 self.maybe_send_next_queued_input();

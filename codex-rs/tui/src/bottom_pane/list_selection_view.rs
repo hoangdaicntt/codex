@@ -1040,6 +1040,12 @@ impl BottomPaneView for ListSelectionView {
         self.selected_actual_idx()
     }
 
+    fn selected_item_is_enabled(&self) -> Option<bool> {
+        self.state
+            .selected_idx
+            .map(|idx| !self.visible_idx_is_disabled(idx))
+    }
+
     fn active_tab_id(&self) -> Option<&str> {
         ListSelectionView::active_tab_id(self)
     }

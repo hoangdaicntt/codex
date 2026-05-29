@@ -329,9 +329,41 @@ impl App {
                     self.chat_widget.add_error_message(err);
                 }
             },
+            AppEvent::AccountsPickerLoadProgress { loaded, total } => {
+                self.chat_widget.update_accounts_picker_loading(loaded, total);
+            }
             AppEvent::AccountsPickerLoaded { result } => match result {
+                Ok(index) if index.accounts.is_empty() => {
+                    if self.chat_widget.dismiss_accounts_picker() {
+                        self.chat_widget.add_info_message(
+                            "No saved ChatGPT accounts.".to_string(),
+                            /*hint*/ None,
+                        );
+                    }
+                }
                 Ok(index) => self.chat_widget.show_accounts_picker(index),
-                Err(err) => self.chat_widget.add_error_message(err),
+                Err(err) => {
+                    if self.chat_widget.dismiss_accounts_picker() {
+                        self.chat_widget.add_error_message(err);
+                    }
+                }
+            },
+            AppEvent::AccountRemoveFinished { result } => match result {
+                Ok(result) => {
+                    self.chat_widget.update_account_state(
+                        result.status_account_display,
+                        result.plan_type,
+                        result.has_chatgpt_account,
+                    );
+                    self.chat_widget.add_info_message(result.message, /*hint*/ None);
+                    self.chat_widget.show_accounts_picker_with_selection(
+                        result.accounts_index,
+                        result.selected_idx,
+                    );
+                }
+                Err(err) => {
+                    self.chat_widget.add_error_message(err);
+                }
             },
             AppEvent::FatalExitRequest(message) => {
                 return Ok(AppRunControl::Exit(ExitReason::Fatal(message)));

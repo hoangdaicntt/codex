@@ -14,6 +14,7 @@ pub use selection::classify_rate_limit_snapshot;
 pub use store::AccountId;
 pub use store::AccountsIndex;
 pub use store::AccountsStore;
+pub use store::RemoveAccountOutcome;
 pub use store::StoredAccount;
 pub use store::StoredAuthFailureKind;
 pub use store::StoredAuthFailureState;

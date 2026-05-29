@@ -16,6 +16,7 @@ use serde::Serialize;
 
 use crate::auth::AuthDotJson;
 use crate::auth::load_auth_dot_json;
+use crate::auth::logout;
 use crate::auth::save_auth;
 
 use super::metadata::AccountMetadata;
@@ -143,6 +144,13 @@ pub struct AccountsStore {
     codex_home: PathBuf,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct RemoveAccountOutcome {
+    pub removed_account: StoredAccount,
+    pub new_active_account: Option<StoredAccount>,
+    pub active_account_changed: bool,
+}
+
 impl AccountsStore {
     pub fn new(codex_home: PathBuf) -> Self {
         Self { codex_home }
@@ -238,6 +246,77 @@ impl AccountsStore {
         self.save(&index)?;
         save_active_auth_json(&self.codex_home, &auth, auth_credentials_store_mode)?;
         Ok(changed)
+    }
+
+    pub fn remove_account(
+        &self,
+        account_id: &AccountId,
+        auth_credentials_store_mode: AuthCredentialsStoreMode,
+    ) -> std::io::Result<RemoveAccountOutcome> {
+        let mut index = self.load()?;
+        let Some(removed_index) = index
+            .accounts
+            .iter()
+            .position(|account| &account.account_id == account_id)
+        else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("account {account_id} was not found"),
+            ));
+        };
+
+        let removed_account = index.accounts.remove(removed_index);
+        let removed_active = index.active_account_id.as_ref() == Some(account_id);
+        let new_active_account = if removed_active {
+            let next_index = if index.accounts.is_empty() {
+                None
+            } else {
+                Some(removed_index.min(index.accounts.len() - 1))
+            };
+            next_index.map(|next_index| index.accounts[next_index].clone())
+        } else {
+            index
+                .active_account_id
+                .as_ref()
+                .and_then(|active_account_id| {
+                    index
+                        .accounts
+                        .iter()
+                        .find(|account| &account.account_id == active_account_id)
+                })
+                .cloned()
+        };
+
+        if removed_active {
+            index.active_account_id = new_active_account
+                .as_ref()
+                .map(|account| account.account_id.clone());
+        }
+
+        self.save(&index)?;
+        if removed_active {
+            if let Some(active_account) = new_active_account.as_ref() {
+                save_active_auth_json(
+                    &self.codex_home,
+                    &active_account.auth,
+                    auth_credentials_store_mode,
+                )?;
+            } else {
+                logout(&self.codex_home, auth_credentials_store_mode)?;
+                if !matches!(
+                    auth_credentials_store_mode,
+                    AuthCredentialsStoreMode::File | AuthCredentialsStoreMode::Ephemeral
+                ) {
+                    logout(&self.codex_home, AuthCredentialsStoreMode::File)?;
+                }
+            }
+        }
+
+        Ok(RemoveAccountOutcome {
+            removed_account,
+            new_active_account,
+            active_account_changed: removed_active,
+        })
     }
 
     pub fn sync_active_auth_json(

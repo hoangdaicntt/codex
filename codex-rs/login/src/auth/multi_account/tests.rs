@@ -147,6 +147,97 @@ fn switch_active_account_rewrites_auth_json() -> anyhow::Result<()> {
 }
 
 #[test]
+fn remove_non_active_account_preserves_active_auth() -> anyhow::Result<()> {
+    let codex_home = tempdir()?;
+    let store = AccountsStore::new(codex_home.path().to_path_buf());
+    store.upsert_active_auth(chatgpt_auth("account-a", "a@example.com"))?;
+    store.upsert_active_auth(chatgpt_auth("account-b", "b@example.com"))?;
+    store.switch_active_account(
+        &AccountId::from("account-a"),
+        AuthCredentialsStoreMode::File,
+    )?;
+
+    let outcome = store.remove_account(
+        &AccountId::from("account-b"),
+        AuthCredentialsStoreMode::File,
+    )?;
+
+    let index = store.load()?;
+    assert_eq!(index.accounts.len(), 1);
+    assert_eq!(index.active_account_id, Some(AccountId::from("account-a")));
+    assert_eq!(outcome.removed_account.account_id, AccountId::from("account-b"));
+    assert!(!outcome.active_account_changed);
+    let auth = load_auth_dot_json(codex_home.path(), AuthCredentialsStoreMode::File)?
+        .expect("active auth should exist");
+    assert_eq!(
+        auth.tokens.and_then(|tokens| tokens.account_id),
+        Some("account-a".to_string())
+    );
+    Ok(())
+}
+
+#[test]
+fn remove_active_account_selects_next_account() -> anyhow::Result<()> {
+    let codex_home = tempdir()?;
+    let store = AccountsStore::new(codex_home.path().to_path_buf());
+    store.upsert_active_auth(chatgpt_auth("account-a", "a@example.com"))?;
+    store.upsert_active_auth(chatgpt_auth("account-b", "b@example.com"))?;
+
+    let outcome = store.remove_account(
+        &AccountId::from("account-b"),
+        AuthCredentialsStoreMode::File,
+    )?;
+
+    let index = store.load()?;
+    assert_eq!(index.accounts.len(), 1);
+    assert_eq!(index.active_account_id, Some(AccountId::from("account-a")));
+    assert_eq!(
+        outcome
+            .new_active_account
+            .as_ref()
+            .map(|account| account.account_id.clone()),
+        Some(AccountId::from("account-a"))
+    );
+    assert!(outcome.active_account_changed);
+    let auth = load_auth_dot_json(codex_home.path(), AuthCredentialsStoreMode::File)?
+        .expect("active auth should exist");
+    assert_eq!(
+        auth.tokens.and_then(|tokens| tokens.account_id),
+        Some("account-a".to_string())
+    );
+    Ok(())
+}
+
+#[test]
+fn remove_last_account_clears_active_auth() -> anyhow::Result<()> {
+    let codex_home = tempdir()?;
+    let store = AccountsStore::new(codex_home.path().to_path_buf());
+    store.upsert_active_auth(chatgpt_auth("account-a", "a@example.com"))?;
+
+    let outcome = store.remove_account(
+        &AccountId::from("account-a"),
+        AuthCredentialsStoreMode::File,
+    )?;
+
+    let index = store.load()?;
+    assert_eq!(
+        index,
+        AccountsIndex {
+            version: 1,
+            active_account_id: None,
+            accounts: Vec::new(),
+        }
+    );
+    assert_eq!(outcome.new_active_account, None);
+    assert!(outcome.active_account_changed);
+    assert_eq!(
+        load_auth_dot_json(codex_home.path(), AuthCredentialsStoreMode::File)?,
+        None
+    );
+    Ok(())
+}
+
+#[test]
 fn selection_skips_exhausted_accounts_until_reset() -> anyhow::Result<()> {
     let codex_home = tempdir()?;
     let store = AccountsStore::new(codex_home.path().to_path_buf());
@@ -261,6 +352,12 @@ fn display_rows_use_compact_account_format() -> anyhow::Result<()> {
             Some((44.0, Utc.with_ymd_and_hms(2026, 5, 31, 10, 0, 0).unwrap())),
         ),
     });
+    index.accounts[0]
+        .auth
+        .tokens
+        .as_mut()
+        .expect("tokens")
+        .access_token = jwt_with_exp(Utc.with_ymd_and_hms(2026, 5, 28, 10, 43, 0).unwrap());
     store.save(&index)?;
     let now = Utc.with_ymd_and_hms(2026, 5, 28, 10, 0, 0).unwrap();
 
@@ -269,9 +366,10 @@ fn display_rows_use_compact_account_format() -> anyhow::Result<()> {
     assert_eq!(rows.len(), 1);
     assert!(rows[0].is_active);
     assert!(rows[0].line.starts_with("* 1. a@example.com\n   "));
-    assert!(rows[0].line.contains("5h 12%/1h12m"));
-    assert!(rows[0].line.contains("Week 44%/3d"));
+    assert!(rows[0].line.contains("5h 88%/1h12m"));
+    assert!(rows[0].line.contains("Week 56%/3d"));
     assert!(rows[0].line.contains("used 2h"));
+    assert!(rows[0].line.contains("token exp 43m"));
     Ok(())
 }
 
@@ -423,8 +521,8 @@ fn mark_active_exhausted_from_snapshot_preserves_display_percentages() -> anyhow
         index.active_account_id.as_ref(),
         Utc::now(),
     );
-    assert!(rows[0].line.contains("5h 12%/-"));
-    assert!(rows[0].line.contains("Week 44%/-"));
+    assert!(rows[0].line.contains("5h 88%/-"));
+    assert!(rows[0].line.contains("Week 56%/-"));
     Ok(())
 }
 
@@ -462,6 +560,19 @@ fn jwt_for_account(account_id: &str, email: &str) -> String {
                 "chatgpt_plan_type": "plus",
                 "chatgpt_user_id": format!("user-{account_id}"),
             }
+        }))
+        .expect("test payload should serialize")
+        .as_bytes(),
+    );
+    format!("{header_b64}.{payload_b64}.sig")
+}
+
+fn jwt_with_exp(expires_at: chrono::DateTime<Utc>) -> String {
+    let encode = |bytes: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+    let header_b64 = encode(br#"{"alg":"none","typ":"JWT"}"#);
+    let payload_b64 = encode(
+        serde_json::to_string(&serde_json::json!({
+            "exp": expires_at.timestamp(),
         }))
         .expect("test payload should serialize")
         .as_bytes(),
