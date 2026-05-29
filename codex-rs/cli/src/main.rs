@@ -1674,7 +1674,7 @@ async fn run_accounts_command(cmd: AccountsCommand) -> anyhow::Result<()> {
     let config = load_cli_config(&cmd.config_overrides).await?;
     let auth_manager =
         AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false).await;
-    let store = AccountsStore::new(config.codex_home.clone());
+    let store = AccountsStore::new(config.codex_home.to_path_buf());
     store.import_active_auth_if_missing(config.cli_auth_credentials_store_mode)?;
     refresh_account_limits_for_display(&config, &store).await;
 
