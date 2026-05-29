@@ -1,0 +1,85 @@
+name: Test and Build
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_MIN_STACK: "8388608"
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: codex-rs
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+
+      - name: Install just
+        uses: taiki-e/install-action@v2
+        with:
+          tool: just
+
+      - name: Run tests
+        run: just test -p codex-cli
+
+  build:
+    name: Build ${{ matrix.name }}
+    needs: test
+    if: github.event_name != 'pull_request'
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux
+            runner: ubuntu-24.04
+            artifact: codex-linux
+            binary: codex
+          - name: macos
+            runner: macos-15
+            artifact: codex-macos
+            binary: codex
+          - name: windows
+            runner: windows-2025
+            artifact: codex-windows
+            binary: codex.exe
+    defaults:
+      run:
+        working-directory: codex-rs
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binary
+        run: cargo build --release -p codex-cli
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: codex-rs/target/release/${{ matrix.binary }}
+          if-no-files-found: error
