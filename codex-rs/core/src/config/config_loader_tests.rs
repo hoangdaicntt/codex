@@ -133,6 +133,18 @@ async fn cli_overrides_resolve_relative_paths_against_cwd() -> std::io::Result<(
 }
 
 #[tokio::test]
+async fn check_for_update_on_startup_defaults_to_false() -> std::io::Result<()> {
+    let codex_home = tempdir().expect("tempdir");
+    let config = ConfigBuilder::default()
+        .codex_home(codex_home.path().to_path_buf())
+        .build()
+        .await?;
+
+    assert!(!config.check_for_update_on_startup);
+    Ok(())
+}
+
+#[tokio::test]
 async fn returns_config_error_for_invalid_user_config_toml() {
     let tmp = tempdir().expect("tempdir");
     let contents = r#"model = "gpt-4"

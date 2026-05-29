@@ -22,6 +22,7 @@ use crate::auth::multi_account::LimitClassification;
 use crate::auth::multi_account::SelectionReason;
 use crate::auth::multi_account::StoredLimitKind;
 use crate::auth::multi_account::StoredLimitState;
+use crate::auth::multi_account::StoredRateLimitSnapshot;
 use crate::auth::multi_account::account_id_at_index;
 use crate::auth::multi_account::classify_rate_limit_snapshot;
 use crate::auth::multi_account::display_rows;
@@ -253,6 +254,13 @@ fn display_rows_use_compact_account_format() -> anyhow::Result<()> {
         resets_at: None,
         snapshot: Some(snapshot(Some(12.0), Some(44.0), None, None)),
     });
+    index.accounts[0].last_rate_limits = Some(StoredRateLimitSnapshot {
+        recorded_at: Utc.with_ymd_and_hms(2026, 5, 28, 8, 0, 0).unwrap(),
+        snapshot: snapshot_with_resets(
+            Some((12.0, Utc.with_ymd_and_hms(2026, 5, 28, 11, 12, 0).unwrap())),
+            Some((44.0, Utc.with_ymd_and_hms(2026, 5, 31, 10, 0, 0).unwrap())),
+        ),
+    });
     store.save(&index)?;
     let now = Utc.with_ymd_and_hms(2026, 5, 28, 10, 0, 0).unwrap();
 
@@ -260,10 +268,10 @@ fn display_rows_use_compact_account_format() -> anyhow::Result<()> {
 
     assert_eq!(rows.len(), 1);
     assert!(rows[0].is_active);
-    assert!(rows[0].line.starts_with("* 1. a@example.com "));
-    assert!(rows[0].line.contains("(5H 12%, Week 44%)"));
-    assert!(rows[0].line.contains("- 2 hours ago | "));
-    assert!(rows[0].line.ends_with("28/05/2026"));
+    assert!(rows[0].line.starts_with("* 1. a@example.com\n   "));
+    assert!(rows[0].line.contains("5h 12%/1h12m"));
+    assert!(rows[0].line.contains("Week 44%/3d"));
+    assert!(rows[0].line.contains("used 2h"));
     Ok(())
 }
 
@@ -415,7 +423,8 @@ fn mark_active_exhausted_from_snapshot_preserves_display_percentages() -> anyhow
         index.active_account_id.as_ref(),
         Utc::now(),
     );
-    assert!(rows[0].line.contains("(5H 12%, Week 44%)"));
+    assert!(rows[0].line.contains("5h 12%/-"));
+    assert!(rows[0].line.contains("Week 44%/-"));
     Ok(())
 }
 
@@ -474,6 +483,29 @@ fn snapshot(
         credits,
         plan_type: None,
         rate_limit_reached_type,
+    }
+}
+
+fn snapshot_with_resets(
+    primary: Option<(f64, chrono::DateTime<Utc>)>,
+    secondary: Option<(f64, chrono::DateTime<Utc>)>,
+) -> RateLimitSnapshot {
+    RateLimitSnapshot {
+        limit_id: Some("codex".to_string()),
+        limit_name: None,
+        primary: primary.map(|(used_percent, resets_at)| RateLimitWindow {
+            used_percent,
+            window_minutes: None,
+            resets_at: Some(resets_at.timestamp()),
+        }),
+        secondary: secondary.map(|(used_percent, resets_at)| RateLimitWindow {
+            used_percent,
+            window_minutes: None,
+            resets_at: Some(resets_at.timestamp()),
+        }),
+        credits: None,
+        plan_type: None,
+        rate_limit_reached_type: None,
     }
 }
 

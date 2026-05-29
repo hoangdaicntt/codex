@@ -1,6 +1,7 @@
 use chrono::DateTime;
 use chrono::Local;
 use chrono::Utc;
+use codex_protocol::protocol::RateLimitWindow;
 
 use super::store::AccountId;
 use super::store::StoredAccount;
@@ -52,13 +53,16 @@ fn display_row(
     let is_active = active_account_id == Some(&account.account_id);
     let marker = if is_active { "* " } else { "  " };
     let email = account.email.as_deref().unwrap_or("-");
-    let five_hour = limit_percent(account, LimitWindowKind::FiveHour);
-    let week = limit_percent(account, LimitWindowKind::Week);
-    let last_used = format_time_ago(account.last_used_at, now);
+    let last_used = format_compact_elapsed(account.last_used_at, now);
     let created_at = format_created_at(account.created_at);
-    let line = format!(
-        "{marker}{index}. {email} (5H {five_hour}, Week {week}) - {last_used} | {created_at}"
-    );
+    let detail = if account.last_auth_failure.is_some() {
+        format!("   auth failed · used {last_used} · {created_at}")
+    } else {
+        let five_hour = limit_display(account, LimitWindowKind::FiveHour, now);
+        let week = limit_display(account, LimitWindowKind::Week, now);
+        format!("   5h {five_hour} · Week {week} · used {last_used} · {created_at}")
+    };
+    let line = format!("{marker}{index}. {email}\n{detail}");
 
     AccountDisplayRow {
         index,
@@ -74,49 +78,75 @@ enum LimitWindowKind {
     Week,
 }
 
-fn limit_percent(account: &StoredAccount, kind: LimitWindowKind) -> String {
+fn limit_display(account: &StoredAccount, kind: LimitWindowKind, now: DateTime<Utc>) -> String {
     let Some(snapshot) = account
-        .last_limit_state
+        .last_rate_limits
         .as_ref()
-        .and_then(|state| state.snapshot.as_ref())
+        .map(|stored| &stored.snapshot)
+        .or_else(|| {
+            account
+                .last_limit_state
+                .as_ref()
+                .and_then(|state| state.snapshot.as_ref())
+        })
     else {
         return "-".to_string();
     };
 
-    let used_percent = match kind {
-        LimitWindowKind::FiveHour => snapshot.primary.as_ref().map(|window| window.used_percent),
-        LimitWindowKind::Week => snapshot
-            .secondary
-            .as_ref()
-            .map(|window| window.used_percent),
+    let window = match kind {
+        LimitWindowKind::FiveHour => snapshot.primary.as_ref(),
+        LimitWindowKind::Week => snapshot.secondary.as_ref(),
     };
 
-    used_percent
-        .map(|percent| format!("{percent:.0}%"))
+    window
+        .map(|window| format_window(window, now))
         .unwrap_or_else(|| "-".to_string())
 }
 
-fn format_time_ago(timestamp: DateTime<Utc>, now: DateTime<Utc>) -> String {
-    let seconds = now.signed_duration_since(timestamp).num_seconds().max(0);
-
-    match seconds {
-        0..=59 => "just now".to_string(),
-        60..=3_599 => plural(seconds / 60, "minute"),
-        3_600..=86_399 => plural(seconds / 3_600, "hour"),
-        86_400..=2_591_999 => plural(seconds / 86_400, "day"),
-        2_592_000..=31_535_999 => plural(seconds / 2_592_000, "month"),
-        _ => plural(seconds / 31_536_000, "year"),
-    }
+fn format_window(window: &RateLimitWindow, now: DateTime<Utc>) -> String {
+    let percent = format!("{:.0}%", window.used_percent);
+    let reset = window
+        .resets_at
+        .and_then(|timestamp| DateTime::from_timestamp(timestamp, 0))
+        .map(|timestamp| format_reset_time(timestamp, now))
+        .unwrap_or_else(|| "-".to_string());
+    format!("{percent}/{reset}")
 }
 
-fn plural(value: i64, unit: &str) -> String {
-    let suffix = if value == 1 { "" } else { "s" };
-    format!("{value} {unit}{suffix} ago")
+fn format_reset_time(timestamp: DateTime<Utc>, now: DateTime<Utc>) -> String {
+    if timestamp <= now {
+        return "now".to_string();
+    }
+    format_compact_duration(timestamp.signed_duration_since(now).num_seconds())
+}
+
+fn format_compact_elapsed(timestamp: DateTime<Utc>, now: DateTime<Utc>) -> String {
+    let seconds = now.signed_duration_since(timestamp).num_seconds().max(0);
+    format_compact_duration(seconds)
+}
+
+fn format_compact_duration(seconds: i64) -> String {
+    match seconds {
+        0..=59 => "now".to_string(),
+        60..=3_599 => format!("{}m", seconds / 60),
+        3_600..=86_399 => {
+            let hours = seconds / 3_600;
+            let minutes = (seconds % 3_600) / 60;
+            if minutes == 0 {
+                format!("{hours}h")
+            } else {
+                format!("{hours}h{minutes}m")
+            }
+        }
+        86_400..=604_799 => format!("{}d", seconds / 86_400),
+        604_800..=31_535_999 => format!("{}w", seconds / 604_800),
+        _ => format!("{}y", seconds / 31_536_000),
+    }
 }
 
 fn format_created_at(timestamp: DateTime<Utc>) -> String {
     timestamp
         .with_timezone(&Local)
-        .format("%H:%M %d/%m/%Y")
+        .format("%d/%m %H:%M")
         .to_string()
 }

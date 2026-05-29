@@ -27,6 +27,7 @@ use codex_app_server_protocol::RateLimitSnapshot;
 use codex_app_server_protocol::SkillsListResponse;
 use codex_app_server_protocol::ThreadGoalStatus;
 use codex_file_search::FileMatch;
+use codex_login::auth::multi_account::AccountsIndex;
 use codex_protocol::ThreadId;
 use codex_protocol::openai_models::ModelPreset;
 use codex_utils_absolute_path::AbsolutePathBuf;
@@ -235,6 +236,11 @@ pub(crate) enum AppEvent {
     /// Result of a `/accounts` account switch request.
     AccountSwitchFinished {
         result: Result<AccountSwitchResult, String>,
+    },
+
+    /// Result of loading saved accounts for the `/accounts` picker.
+    AccountsPickerLoaded {
+        result: Result<AccountsIndex, String>,
     },
 
     /// Request to exit the application due to a fatal error.

@@ -2,6 +2,7 @@ mod display;
 mod metadata;
 mod selection;
 mod store;
+mod token_refresh;
 
 pub use display::AccountDisplayRow;
 pub use display::account_id_at_index;
@@ -18,6 +19,9 @@ pub use store::StoredAuthFailureKind;
 pub use store::StoredAuthFailureState;
 pub use store::StoredLimitKind;
 pub use store::StoredLimitState;
+pub use store::StoredRateLimitSnapshot;
+pub use token_refresh::ResolvedStoredAccountAuth;
+pub use token_refresh::stored_auth_is_stale;
 
 #[cfg(test)]
 mod tests;

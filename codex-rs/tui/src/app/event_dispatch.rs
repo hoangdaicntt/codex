@@ -329,6 +329,10 @@ impl App {
                     self.chat_widget.add_error_message(err);
                 }
             },
+            AppEvent::AccountsPickerLoaded { result } => match result {
+                Ok(index) => self.chat_widget.show_accounts_picker(index),
+                Err(err) => self.chat_widget.add_error_message(err),
+            },
             AppEvent::FatalExitRequest(message) => {
                 return Ok(AppRunControl::Exit(ExitReason::Fatal(message)));
             }

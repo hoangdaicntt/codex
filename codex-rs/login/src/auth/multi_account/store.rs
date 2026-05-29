@@ -86,6 +86,8 @@ pub struct StoredAccount {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_limit_state: Option<StoredLimitState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_rate_limits: Option<StoredRateLimitSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_auth_failure: Option<StoredAuthFailureState>,
     pub auth: AuthDotJson,
 }
@@ -127,6 +129,13 @@ impl StoredLimitState {
     pub fn is_active(&self, now: DateTime<Utc>) -> bool {
         self.resets_at.is_none_or(|resets_at| resets_at > now)
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StoredRateLimitSnapshot {
+    pub recorded_at: DateTime<Utc>,
+    pub snapshot: RateLimitSnapshot,
 }
 
 #[derive(Clone, Debug)]
@@ -250,6 +259,53 @@ impl AccountsStore {
         Ok(true)
     }
 
+    pub fn update_account_auth(
+        &self,
+        account_id: &AccountId,
+        auth: AuthDotJson,
+        auth_credentials_store_mode: AuthCredentialsStoreMode,
+    ) -> std::io::Result<()> {
+        let mut index = self.load()?;
+        let active_account_id = index.active_account_id.clone();
+        let Some(account) = index
+            .accounts
+            .iter_mut()
+            .find(|account| &account.account_id == account_id)
+        else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("account {account_id} was not found"),
+            ));
+        };
+        account.auth = auth.clone();
+        account.last_auth_failure = None;
+        self.save(&index)?;
+        if active_account_id.as_ref() == Some(account_id) {
+            save_active_auth_json(&self.codex_home, &auth, auth_credentials_store_mode)?;
+        }
+        Ok(())
+    }
+
+    pub fn mark_account_rate_limits(
+        &self,
+        account_id: &AccountId,
+        snapshot: RateLimitSnapshot,
+    ) -> std::io::Result<()> {
+        let mut index = self.load()?;
+        let Some(account) = index
+            .accounts
+            .iter_mut()
+            .find(|account| &account.account_id == account_id)
+        else {
+            return Ok(());
+        };
+        account.last_rate_limits = Some(StoredRateLimitSnapshot {
+            recorded_at: Utc::now(),
+            snapshot,
+        });
+        self.save(&index)
+    }
+
     pub fn active_limit_kind(
         &self,
         now: DateTime<Utc>,
@@ -341,14 +397,23 @@ impl AccountsStore {
     }
 
     pub fn mark_active_refresh_failed(&self, message: Option<String>) -> std::io::Result<()> {
-        let mut index = self.load()?;
+        let index = self.load()?;
         let Some(active_account_id) = index.active_account_id.clone() else {
             return Ok(());
         };
+        self.mark_account_refresh_failed(&active_account_id, message)
+    }
+
+    pub fn mark_account_refresh_failed(
+        &self,
+        account_id: &AccountId,
+        message: Option<String>,
+    ) -> std::io::Result<()> {
+        let mut index = self.load()?;
         let Some(account) = index
             .accounts
             .iter_mut()
-            .find(|account| account.account_id == active_account_id)
+            .find(|account| &account.account_id == account_id)
         else {
             return Ok(());
         };
@@ -411,6 +476,7 @@ fn upsert_auth(
             created_at: now,
             last_used_at: now,
             last_limit_state: None,
+            last_rate_limits: None,
             last_auth_failure: None,
             auth,
         });
