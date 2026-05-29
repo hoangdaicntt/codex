@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use chrono::DateTime;
 use chrono::Utc;
 use reqwest::StatusCode;
 use serde::Deserialize;
@@ -23,8 +24,18 @@ use codex_app_server_protocol::AuthMode;
 use codex_app_server_protocol::AuthMode as ApiAuthMode;
 use codex_protocol::config_types::ForcedLoginMethod;
 use codex_protocol::config_types::ModelProviderAuthInfo;
+use codex_protocol::protocol::RateLimitSnapshot;
 
 use super::external_bearer::BearerTokenRefresher;
+use super::multi_account::AccountDisplayRow;
+use super::multi_account::AccountId;
+use super::multi_account::AccountsIndex;
+use super::multi_account::AccountsStore;
+use super::multi_account::SelectionReason;
+use super::multi_account::StoredAccount;
+use super::multi_account::StoredLimitKind;
+use super::multi_account::account_id_at_index;
+use super::multi_account::display_rows;
 use super::revoke::revoke_auth_tokens;
 pub use crate::auth::agent_identity::AgentIdentityAuth;
 pub use crate::auth::storage::AgentIdentityAuthRecord;
@@ -1314,6 +1325,11 @@ impl AuthManager {
         auth_credentials_store_mode: AuthCredentialsStoreMode,
         chatgpt_base_url: Option<String>,
     ) -> Self {
+        if let Err(err) = AccountsStore::new(codex_home.clone())
+            .import_active_auth_if_missing(auth_credentials_store_mode)
+        {
+            tracing::warn!("failed to import active auth into accounts.json: {err}");
+        }
         let managed_auth = load_auth(
             &codex_home,
             enable_codex_api_key_env,
@@ -1404,6 +1420,97 @@ impl AuthManager {
     /// Current cached auth (clone) without attempting a refresh.
     pub fn auth_cached(&self) -> Option<CodexAuth> {
         self.inner.read().ok().and_then(|c| c.auth.clone())
+    }
+
+    pub fn active_account_id(&self) -> Option<String> {
+        self.auth_cached()
+            .as_ref()
+            .and_then(CodexAuth::get_account_id)
+    }
+
+    pub fn list_accounts(&self) -> std::io::Result<Vec<StoredAccount>> {
+        let index = self.load_accounts_index()?;
+        Ok(index.accounts)
+    }
+
+    pub fn list_account_display_rows(&self) -> std::io::Result<Vec<AccountDisplayRow>> {
+        let index = self.load_accounts_index()?;
+        Ok(display_rows(
+            &index.accounts,
+            index.active_account_id.as_ref(),
+            Utc::now(),
+        ))
+    }
+
+    pub fn sync_active_auth_json(&self) -> std::io::Result<bool> {
+        AccountsStore::new(self.codex_home.clone())
+            .sync_active_auth_json(self.auth_credentials_store_mode)
+    }
+
+    pub async fn switch_account(&self, account_id: &str) -> std::io::Result<bool> {
+        let changed = AccountsStore::new(self.codex_home.clone()).switch_active_account(
+            &AccountId::from(account_id),
+            self.auth_credentials_store_mode,
+        )?;
+        self.reload().await;
+        Ok(changed)
+    }
+
+    pub async fn switch_account_by_index(&self, index: usize) -> std::io::Result<bool> {
+        let accounts = self.list_accounts()?;
+        let account_id = account_id_at_index(&accounts, index)?;
+        self.switch_account(account_id.as_str()).await
+    }
+
+    pub fn mark_active_account_limited(
+        &self,
+        snapshot: RateLimitSnapshot,
+    ) -> std::io::Result<Option<StoredLimitKind>> {
+        AccountsStore::new(self.codex_home.clone()).mark_active_from_snapshot(snapshot)
+    }
+
+    pub fn mark_active_account_exhausted(
+        &self,
+        resets_at: Option<DateTime<Utc>>,
+    ) -> std::io::Result<()> {
+        AccountsStore::new(self.codex_home.clone()).mark_active_exhausted(resets_at)
+    }
+
+    pub fn mark_active_account_exhausted_from_snapshot(
+        &self,
+        snapshot: RateLimitSnapshot,
+        fallback_resets_at: Option<DateTime<Utc>>,
+    ) -> std::io::Result<()> {
+        AccountsStore::new(self.codex_home.clone())
+            .mark_active_exhausted_from_snapshot(snapshot, fallback_resets_at)
+    }
+
+    pub async fn switch_to_next_available_account(
+        &self,
+        reason: SelectionReason,
+    ) -> std::io::Result<Option<String>> {
+        let store = AccountsStore::new(self.codex_home.clone());
+        let forced_workspace_ids = self.forced_chatgpt_workspace_id();
+        let Some(next_account_id) =
+            store.next_available_account(reason, forced_workspace_ids.as_deref())?
+        else {
+            return Ok(None);
+        };
+        store.switch_active_account(&next_account_id, self.auth_credentials_store_mode)?;
+        self.reload().await;
+        Ok(Some(next_account_id.to_string()))
+    }
+
+    pub async fn switch_if_active_account_limited(&self) -> std::io::Result<Option<String>> {
+        let store = AccountsStore::new(self.codex_home.clone());
+        let Some(kind) = store.active_limit_kind(Utc::now())? else {
+            return Ok(None);
+        };
+        let reason = match kind {
+            StoredLimitKind::NearLimit => SelectionReason::ProactiveNearLimit,
+            StoredLimitKind::Exhausted => SelectionReason::UsageLimitReached,
+        };
+        self.switch_to_next_available_account(reason).await
     }
 
     /// Subscribes to cached auth changes that can affect request recovery.
@@ -1518,7 +1625,7 @@ impl AuthManager {
         attempted_auth: &CodexAuth,
         error: &RefreshTokenFailedError,
     ) {
-        if let Ok(mut guard) = self.inner.write() {
+        let should_mark_active = if let Ok(mut guard) = self.inner.write() {
             let current_auth_matches =
                 Self::auths_equal_for_refresh(Some(attempted_auth), guard.auth.as_ref());
             if current_auth_matches {
@@ -1527,6 +1634,16 @@ impl AuthManager {
                     error: error.clone(),
                 });
             }
+            current_auth_matches
+        } else {
+            false
+        };
+
+        if should_mark_active
+            && let Err(err) = AccountsStore::new(self.codex_home.clone())
+                .mark_active_refresh_failed(Some(error.to_string()))
+        {
+            tracing::warn!("failed to mark active account refresh failure: {err}");
         }
     }
 
@@ -1540,6 +1657,11 @@ impl AuthManager {
         .await
         .ok()
         .flatten()
+    }
+
+    fn load_accounts_index(&self) -> std::io::Result<AccountsIndex> {
+        let store = AccountsStore::new(self.codex_home.clone());
+        store.import_active_auth_if_missing(self.auth_credentials_store_mode)
     }
 
     fn set_cached_auth(&self, new_auth: Option<CodexAuth>) -> bool {
@@ -1895,13 +2017,19 @@ impl AuthManager {
     ) -> Result<(), RefreshTokenError> {
         let refresh_response = request_chatgpt_token_refresh(refresh_token, auth.client()).await?;
 
-        persist_tokens(
+        let auth_dot_json = persist_tokens(
             auth.storage(),
             refresh_response.id_token,
             refresh_response.access_token,
             refresh_response.refresh_token,
         )
         .map_err(RefreshTokenError::from)?;
+        AccountsStore::new(self.codex_home.clone())
+            .upsert_active_auth(auth_dot_json)
+            .map_err(RefreshTokenError::from)?;
+        AccountsStore::new(self.codex_home.clone())
+            .sync_active_auth_json(self.auth_credentials_store_mode)
+            .map_err(RefreshTokenError::from)?;
         self.reload().await;
 
         Ok(())

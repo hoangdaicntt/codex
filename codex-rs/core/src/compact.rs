@@ -575,6 +575,13 @@ async fn drain_to_completed(
                 sess.set_server_reasoning_included(included).await;
             }
             Ok(ResponseEvent::RateLimits(snapshot)) => {
+                if let Err(err) = sess
+                    .services
+                    .auth_manager
+                    .mark_active_account_limited(snapshot.clone())
+                {
+                    tracing::warn!("failed to record active account rate-limit state: {err}");
+                }
                 sess.update_rate_limits(turn_context, snapshot).await;
             }
             Ok(ResponseEvent::Completed { token_usage, .. }) => {

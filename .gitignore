@@ -13,6 +13,7 @@ bazel-*
 user.bazelrc
 build/
 out/
+docker-build-out/
 storybook-static/
 
 # ignore README for publishing
