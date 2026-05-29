@@ -1,0 +1,4 @@
+interface:
+  display_name: "GitHub Hosted Test Build"
+  short_description: "Run Codex tests and builds on GitHub"
+  default_prompt: "Use $github-hosted-test-build to test my feature branch on GitHub-hosted runners."
