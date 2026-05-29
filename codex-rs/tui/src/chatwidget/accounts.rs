@@ -126,6 +126,7 @@ fn account_selection_params(
                 let tx = tx.clone();
                 let config = config.clone();
                 let status_account_display = status_account_display.clone();
+                let switch_message_email = switch_message_email.clone();
                 tokio::spawn(async move {
                     let result = match AuthManager::shared_from_config(
                         &config, /*enable_codex_api_key_env*/ false,
