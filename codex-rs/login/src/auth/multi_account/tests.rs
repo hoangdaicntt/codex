@@ -1,5 +1,4 @@
 use base64::Engine;
-use chrono::Duration;
 use chrono::TimeZone;
 use chrono::Utc;
 use codex_app_server_protocol::AuthMode;
@@ -238,7 +237,7 @@ fn remove_last_account_clears_active_auth() -> anyhow::Result<()> {
 }
 
 #[test]
-fn selection_skips_exhausted_accounts_until_reset() -> anyhow::Result<()> {
+fn selection_uses_next_picker_account_even_when_exhausted() -> anyhow::Result<()> {
     let codex_home = tempdir()?;
     let store = AccountsStore::new(codex_home.path().to_path_buf());
     store.upsert_active_auth(chatgpt_auth("account-a", "a@example.com"))?;
@@ -260,12 +259,12 @@ fn selection_skips_exhausted_accounts_until_reset() -> anyhow::Result<()> {
 
     let next = store.next_available_account(SelectionReason::ProactiveNearLimit, None)?;
 
-    assert_eq!(next, Some(AccountId::from("account-c")));
+    assert_eq!(next, Some(AccountId::from("account-b")));
     Ok(())
 }
 
 #[test]
-fn selection_skips_near_limit_accounts_until_reset() -> anyhow::Result<()> {
+fn selection_uses_next_picker_account_even_when_near_limit() -> anyhow::Result<()> {
     let codex_home = tempdir()?;
     let store = AccountsStore::new(codex_home.path().to_path_buf());
     store.upsert_active_auth(chatgpt_auth("account-a", "a@example.com"))?;
@@ -283,29 +282,25 @@ fn selection_skips_near_limit_accounts_until_reset() -> anyhow::Result<()> {
 
     let next = store.next_available_account(SelectionReason::ProactiveNearLimit, None)?;
 
-    assert_eq!(next, Some(AccountId::from("account-c")));
+    assert_eq!(next, Some(AccountId::from("account-b")));
     Ok(())
 }
 
 #[test]
-fn selection_allows_accounts_after_limit_reset_expires() -> anyhow::Result<()> {
+fn selection_wraps_from_last_account_to_first() -> anyhow::Result<()> {
     let codex_home = tempdir()?;
     let store = AccountsStore::new(codex_home.path().to_path_buf());
     store.upsert_active_auth(chatgpt_auth("account-a", "a@example.com"))?;
     store.upsert_active_auth(chatgpt_auth("account-b", "b@example.com"))?;
+    store.upsert_active_auth(chatgpt_auth("account-c", "c@example.com"))?;
     store.switch_active_account(
-        &AccountId::from("account-b"),
-        AuthCredentialsStoreMode::File,
-    )?;
-    store.mark_active_exhausted(Some(Utc::now() - Duration::minutes(1)))?;
-    store.switch_active_account(
-        &AccountId::from("account-a"),
+        &AccountId::from("account-c"),
         AuthCredentialsStoreMode::File,
     )?;
 
     let next = store.next_available_account(SelectionReason::UsageLimitReached, None)?;
 
-    assert_eq!(next, Some(AccountId::from("account-b")));
+    assert_eq!(next, Some(AccountId::from("account-a")));
     Ok(())
 }
 

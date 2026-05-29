@@ -517,7 +517,6 @@ impl AccountsStore {
             &index,
             active_account_id,
             forced_workspace_ids,
-            Utc::now(),
         ))
     }
 }
