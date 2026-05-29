@@ -93,6 +93,7 @@ use http::HeaderValue;
 use http::StatusCode as HttpStatusCode;
 use reqwest::StatusCode;
 use std::time::Duration;
+use tokio::sync::watch;
 use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
@@ -181,6 +182,15 @@ struct ModelClientState {
     attestation_provider: Option<Arc<dyn AttestationProvider>>,
     disable_websockets: AtomicBool,
     cached_websocket_session: StdMutex<WebsocketSession>,
+    auth_change_rx: Option<AuthChangeReceiver>,
+}
+
+struct AuthChangeReceiver(StdMutex<watch::Receiver<u64>>);
+
+impl std::fmt::Debug for AuthChangeReceiver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AuthChangeReceiver")
+    }
 }
 
 /// Resolved API client setup for a single request attempt.
@@ -327,6 +337,9 @@ impl ModelClient {
         beta_features_header: Option<String>,
         attestation_provider: Option<Arc<dyn AttestationProvider>>,
     ) -> Self {
+        let auth_change_rx = auth_manager
+            .as_ref()
+            .map(|manager| AuthChangeReceiver(StdMutex::new(manager.auth_change_receiver())));
         let model_provider = create_model_provider(provider_info, auth_manager);
         let codex_api_key_env_enabled = model_provider
             .auth_manager()
@@ -352,6 +365,7 @@ impl ModelClient {
                 attestation_provider,
                 disable_websockets: AtomicBool::new(false),
                 cached_websocket_session: StdMutex::new(WebsocketSession::default()),
+                auth_change_rx,
             }),
             prompt_cache_key_override: None,
         }
@@ -807,6 +821,9 @@ impl ModelClient {
     /// This centralizes setup used by both prewarm and normal request paths so they stay in
     /// lockstep when auth/provider resolution changes.
     async fn current_client_setup(&self) -> Result<CurrentClientSetup> {
+        if self.consume_auth_change_revision() {
+            self.store_cached_websocket_session(WebsocketSession::default());
+        }
         let auth = self.state.provider.auth().await;
         let api_provider = self.state.provider.api_provider().await?;
         let api_auth = self.state.provider.api_auth().await?;
@@ -815,6 +832,20 @@ impl ModelClient {
             api_provider,
             api_auth,
         })
+    }
+
+    fn consume_auth_change_revision(&self) -> bool {
+        let Some(auth_change_rx) = &self.state.auth_change_rx else {
+            return false;
+        };
+        let Ok(mut auth_change_rx) = auth_change_rx.0.lock() else {
+            return false;
+        };
+        let Ok(true) = auth_change_rx.has_changed() else {
+            return false;
+        };
+        auth_change_rx.borrow_and_update();
+        true
     }
 
     /// Opens a websocket connection using the same header and telemetry wiring as normal turns.
@@ -1371,6 +1402,9 @@ impl ModelClientSession {
             .map(AuthManager::unauthorized_recovery);
         let mut pending_retry = PendingUnauthorizedRetry::default();
         loop {
+            if self.client.consume_auth_change_revision() {
+                self.reset_websocket_session();
+            }
             let client_setup = self.client.current_client_setup().await?;
             let request_auth_context = AuthRequestTelemetryContext::new(
                 client_setup.auth.as_ref().map(CodexAuth::auth_mode),

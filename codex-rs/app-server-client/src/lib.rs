@@ -26,6 +26,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub use codex_app_server::app_server_control_socket_path;
+pub use codex_app_server::AuthManager;
 pub use codex_app_server::in_process::DEFAULT_IN_PROCESS_CHANNEL_CAPACITY;
 pub use codex_app_server::in_process::InProcessServerEvent;
 use codex_app_server::in_process::InProcessStartArgs;
@@ -464,6 +465,7 @@ pub struct InProcessAppServerClient {
     command_tx: mpsc::Sender<ClientCommand>,
     event_rx: mpsc::Receiver<InProcessServerEvent>,
     worker_handle: tokio::task::JoinHandle<()>,
+    auth_manager: Arc<AuthManager>,
 }
 
 #[derive(Clone)]
@@ -493,6 +495,7 @@ impl InProcessAppServerClient {
         let mut handle =
             codex_app_server::in_process::start(args.into_runtime_start_args()).await?;
         let request_sender = handle.sender();
+        let auth_manager = handle.auth_manager();
         let (command_tx, mut command_rx) = mpsc::channel::<ClientCommand>(channel_capacity);
         let (event_tx, event_rx) = mpsc::channel::<InProcessServerEvent>(channel_capacity);
 
@@ -604,7 +607,12 @@ impl InProcessAppServerClient {
             command_tx,
             event_rx,
             worker_handle,
+            auth_manager,
         })
+    }
+
+    pub fn auth_manager(&self) -> Arc<AuthManager> {
+        self.auth_manager.clone()
     }
 
     pub fn request_handle(&self) -> InProcessAppServerRequestHandle {
@@ -859,6 +867,13 @@ impl AppServerRequestHandle {
 }
 
 impl AppServerClient {
+    pub fn auth_manager(&self) -> Option<Arc<AuthManager>> {
+        match self {
+            Self::InProcess(client) => Some(client.auth_manager()),
+            Self::Remote(_) => None,
+        }
+    }
+
     pub async fn request(&self, request: ClientRequest) -> IoResult<RequestResult> {
         match self {
             Self::InProcess(client) => client.request(request).await,

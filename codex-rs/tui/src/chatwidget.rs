@@ -321,7 +321,7 @@ use crate::status_indicator_widget::STATUS_DETAILS_DEFAULT_MAX_LINES;
 use crate::status_indicator_widget::StatusDetailsCapitalization;
 use crate::text_formatting::truncate_text;
 use crate::tui::FrameRequester;
-mod accounts;
+pub(crate) mod accounts;
 mod command_lifecycle;
 mod connectors;
 mod constructor;

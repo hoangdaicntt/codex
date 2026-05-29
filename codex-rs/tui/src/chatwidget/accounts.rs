@@ -8,6 +8,7 @@ use codex_login::RefreshTokenError;
 use codex_login::auth::multi_account::AccountId;
 use codex_login::auth::multi_account::AccountsIndex;
 use codex_login::auth::multi_account::AccountsStore;
+use codex_login::auth::multi_account::account_id_at_index;
 use codex_login::auth::multi_account::display_rows;
 use codex_model_provider::BearerAuthProvider;
 use codex_protocol::protocol::RateLimitSnapshot as CoreRateLimitSnapshot;
@@ -62,13 +63,9 @@ impl ChatWidget {
         let Some(account) = index.accounts.get(selected_idx) else {
             return false;
         };
-        let config = self.config.clone();
-        let account_id = account.account_id.clone();
         let tx = self.app_event_tx.clone();
-        tokio::spawn(async move {
-            let result = remove_account_for_picker(config, account_id).await;
-            tx.send(AppEvent::AccountRemoveFinished { result });
-        });
+        let account_id = account.account_id.clone();
+        tx.send(AppEvent::AccountRemoveRequested { account_id });
         true
     }
 
@@ -82,7 +79,6 @@ impl ChatWidget {
         selected_idx: Option<usize>,
     ) {
         let params = account_selection_params(
-            &self.config,
             index,
             selected_idx,
             accounts_picker_footer_hint(),
@@ -243,7 +239,6 @@ fn preferred_account_limit_snapshot(
 }
 
 fn account_selection_params(
-    config: &Config,
     index: AccountsIndex,
     selected_idx: Option<usize>,
     footer_hint: Line<'static>,
@@ -262,39 +257,8 @@ fn account_selection_params(
         .zip(index.accounts)
         .map(|(row, account)| {
             let row_index = row.index;
-            let config = config.clone();
-            let email = account.email.clone();
-            let switch_message_email = email.clone().unwrap_or_else(|| "-".to_string());
-            let plan_type = account.plan_type;
-            let status_account_display = Some(StatusAccountDisplay::ChatGpt {
-                email,
-                plan: plan_type.map(|plan_type| format!("{plan_type:?}")),
-            });
             let actions: Vec<SelectionAction> = vec![Box::new(move |tx| {
-                let tx = tx.clone();
-                let config = config.clone();
-                let status_account_display = status_account_display.clone();
-                let switch_message_email = switch_message_email.clone();
-                tokio::spawn(async move {
-                    let result = match AuthManager::shared_from_config(
-                        &config, /*enable_codex_api_key_env*/ false,
-                    )
-                    .await
-                    .switch_account_by_index(row_index)
-                    .await
-                    {
-                        Ok(_) => Ok(AccountSwitchResult {
-                            message: format!(
-                                "Switched active account to {row_index}. {switch_message_email}."
-                            ),
-                            status_account_display,
-                            plan_type,
-                            has_chatgpt_account: true,
-                        }),
-                        Err(err) => Err(format!("Account switch failed: {err}")),
-                    };
-                    tx.send(AppEvent::AccountSwitchFinished { result });
-                });
+                tx.send(AppEvent::AccountSwitchRequested { index: row_index });
             })];
 
             SelectionItem {
@@ -319,8 +283,44 @@ fn account_selection_params(
     }
 }
 
-async fn remove_account_for_picker(
+pub(crate) async fn switch_account_for_picker(
     config: Config,
+    auth_manager: Arc<AuthManager>,
+    index: usize,
+) -> Result<AccountSwitchResult, String> {
+    let store = AccountsStore::new(config.codex_home.to_path_buf());
+    let accounts_index = store
+        .load()
+        .map_err(|err| format!("Failed to load saved accounts: {err}"))?;
+    let account_id = account_id_at_index(&accounts_index.accounts, index)
+        .map_err(|err| format!("Account switch failed: {err}"))?;
+    let account = accounts_index
+        .accounts
+        .iter()
+        .find(|account| account.account_id == account_id)
+        .expect("account_id_at_index returned an existing account id");
+    let email = account.email.clone();
+    let switch_message_email = email.clone().unwrap_or_else(|| "-".to_string());
+    let plan_type = account.plan_type;
+    let status_account_display = Some(StatusAccountDisplay::ChatGpt {
+        email,
+        plan: plan_type.map(|plan_type| format!("{plan_type:?}")),
+    });
+    auth_manager
+        .switch_account_by_index(index)
+        .await
+        .map_err(|err| format!("Account switch failed: {err}"))?;
+    Ok(AccountSwitchResult {
+        message: format!("Switched active account to {index}. {switch_message_email}."),
+        status_account_display,
+        plan_type,
+        has_chatgpt_account: true,
+    })
+}
+
+pub(crate) async fn remove_account_for_picker(
+    config: Config,
+    auth_manager: Arc<AuthManager>,
     account_id: AccountId,
 ) -> Result<AccountRemoveResult, String> {
     let store = AccountsStore::new(config.codex_home.to_path_buf());
@@ -335,10 +335,7 @@ async fn remove_account_for_picker(
     let outcome = store
         .remove_account(&account_id, config.cli_auth_credentials_store_mode)
         .map_err(|err| format!("Account remove failed: {err}"))?;
-    AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false)
-        .await
-        .reload()
-        .await;
+    auth_manager.reload().await;
     let accounts_index = store
         .load()
         .map_err(|err| format!("Failed to load saved accounts: {err}"))?;
@@ -393,26 +390,28 @@ fn accounts_picker_footer_hint() -> Line<'static> {
 
 #[cfg(test)]
 mod tests {
+    use base64::Engine;
     use chrono::TimeZone;
     use chrono::Utc;
     use codex_app_server_protocol::AuthMode;
     use codex_login::AuthDotJson;
     use codex_login::auth::multi_account::AccountId;
+    use codex_login::auth::multi_account::AccountsStore;
     use codex_login::auth::multi_account::StoredAccount;
+    use codex_login::token_data::IdTokenInfo;
+    use codex_login::TokenData;
+    use codex_model_provider::create_model_provider;
+    use codex_model_provider::ModelProvider;
+    use codex_protocol::auth::KnownPlan;
+    use codex_protocol::auth::PlanType as AuthPlanType;
     use codex_protocol::account::PlanType;
 
     use crate::legacy_core::config::ConfigBuilder;
 
     use super::*;
 
-    #[tokio::test]
-    async fn account_selection_params_renders_account_rows() {
-        let codex_home = tempfile::tempdir().unwrap();
-        let config = ConfigBuilder::default()
-            .codex_home(codex_home.path().to_path_buf())
-            .build()
-            .await
-            .expect("config");
+    #[test]
+    fn account_selection_params_renders_account_rows() {
         let account = StoredAccount {
             account_id: AccountId::from("account-a"),
             email: Some("a@example.com".to_string()),
@@ -437,7 +436,7 @@ mod tests {
             accounts: vec![account],
         };
 
-        let params = account_selection_params(&config, index, None, accounts_picker_footer_hint());
+        let params = account_selection_params(index, None, accounts_picker_footer_hint());
 
         assert_eq!(params.items.len(), 1);
         assert!(params.items[0].name.contains("* 1. a@example.com"));
@@ -462,5 +461,112 @@ mod tests {
         assert_eq!(params.items.len(), 1);
         assert_eq!(params.items[0].name, "Loading saved accounts 1/4...");
         assert!(params.items[0].is_disabled);
+    }
+
+    #[tokio::test]
+    async fn switch_account_for_picker_updates_passed_auth_manager() {
+        let codex_home = tempfile::tempdir().unwrap();
+        let config = ConfigBuilder::default()
+            .codex_home(codex_home.path().to_path_buf())
+            .build()
+            .await
+            .expect("config");
+        let store = AccountsStore::new(config.codex_home.to_path_buf());
+        store
+            .upsert_active_auth(chatgpt_auth("account-a", "a@example.com"))
+            .expect("upsert account a");
+        store
+            .upsert_active_auth(chatgpt_auth("account-b", "b@example.com"))
+            .expect("upsert account b");
+        let auth_manager =
+            AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false).await;
+        assert_eq!(
+            auth_manager.active_account_id().as_deref(),
+            Some("account-b")
+        );
+
+        let result = switch_account_for_picker(config.clone(), auth_manager.clone(), 1)
+            .await
+            .expect("switch account");
+
+        assert_eq!(
+            result.message,
+            "Switched active account to 1. a@example.com."
+        );
+        assert_eq!(
+            auth_manager.active_account_id().as_deref(),
+            Some("account-a")
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_with_session_auth_manager_uses_switched_account() {
+        let codex_home = tempfile::tempdir().unwrap();
+        let config = ConfigBuilder::default()
+            .codex_home(codex_home.path().to_path_buf())
+            .build()
+            .await
+            .expect("config");
+        let store = AccountsStore::new(config.codex_home.to_path_buf());
+        store
+            .upsert_active_auth(chatgpt_auth("account-a", "a@example.com"))
+            .expect("upsert account a");
+        store
+            .upsert_active_auth(chatgpt_auth("account-b", "b@example.com"))
+            .expect("upsert account b");
+        let auth_manager =
+            AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false).await;
+        let provider = create_model_provider(
+            config.model_provider.clone(),
+            Some(auth_manager.clone()),
+        );
+
+        switch_account_for_picker(config, auth_manager, 1)
+            .await
+            .expect("switch account");
+
+        let auth = provider.auth().await.expect("provider auth");
+        assert_eq!(auth.get_account_id().as_deref(), Some("account-a"));
+    }
+
+    fn chatgpt_auth(account_id: &str, email: &str) -> AuthDotJson {
+        let raw_jwt = jwt_for_account(account_id, email);
+        AuthDotJson {
+            auth_mode: Some(AuthMode::Chatgpt),
+            openai_api_key: None,
+            tokens: Some(TokenData {
+                id_token: IdTokenInfo {
+                    email: Some(email.to_string()),
+                    chatgpt_plan_type: Some(AuthPlanType::Known(KnownPlan::Plus)),
+                    chatgpt_user_id: Some(format!("user-{account_id}")),
+                    chatgpt_account_id: Some(account_id.to_string()),
+                    chatgpt_account_is_fedramp: false,
+                    raw_jwt,
+                },
+                access_token: format!("access-{account_id}"),
+                refresh_token: format!("refresh-{account_id}"),
+                account_id: Some(account_id.to_string()),
+            }),
+            last_refresh: Some(Utc::now()),
+            agent_identity: None,
+        }
+    }
+
+    fn jwt_for_account(account_id: &str, email: &str) -> String {
+        let encode = |bytes: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+        let header_b64 = encode(br#"{"alg":"none","typ":"JWT"}"#);
+        let payload_b64 = encode(
+            serde_json::to_string(&serde_json::json!({
+                "email": email,
+                "https://api.openai.com/auth": {
+                    "chatgpt_account_id": account_id,
+                    "chatgpt_plan_type": "plus",
+                    "chatgpt_user_id": format!("user-{account_id}"),
+                }
+            }))
+            .expect("test payload should serialize")
+            .as_bytes(),
+        );
+        format!("{header_b64}.{payload_b64}.sig")
     }
 }
