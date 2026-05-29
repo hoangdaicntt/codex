@@ -773,6 +773,7 @@ impl InProcessAppServerClient {
             command_tx,
             event_rx,
             worker_handle,
+            auth_manager: _,
         } = self;
         let mut worker_handle = worker_handle;
         // Drop the caller-facing receiver before asking the worker to shut
