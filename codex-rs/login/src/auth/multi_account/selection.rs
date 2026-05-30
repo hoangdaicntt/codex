@@ -1,6 +1,5 @@
 use chrono::DateTime;
 use chrono::Utc;
-use codex_protocol::protocol::CreditsSnapshot;
 use codex_protocol::protocol::RateLimitReachedType;
 use codex_protocol::protocol::RateLimitSnapshot;
 use codex_protocol::protocol::RateLimitWindow;
@@ -30,19 +29,16 @@ pub enum LimitClassification {
 }
 
 pub fn classify_rate_limit_snapshot(snapshot: &RateLimitSnapshot) -> LimitClassification {
-    if snapshot.credits.as_ref().is_some_and(credits_are_exhausted)
-        || snapshot
-            .rate_limit_reached_type
-            .is_some_and(reached_type_is_exhausted)
+    if snapshot
+        .rate_limit_reached_type
+        .is_some_and(reached_type_is_exhausted)
     {
         return LimitClassification::Exhausted {
             resets_at: snapshot_reset_time(snapshot),
         };
     }
 
-    if window_is_near_limit(snapshot.primary.as_ref())
-        || window_is_near_limit(snapshot.secondary.as_ref())
-    {
+    if window_is_near_limit(snapshot.primary.as_ref()) {
         return LimitClassification::NearLimit {
             resets_at: snapshot_reset_time(snapshot),
         };
@@ -122,15 +118,31 @@ fn account_is_eligible(
         SelectionReason::AuthFailure
             | SelectionReason::ProactiveNearLimit
             | SelectionReason::UsageLimitReached
-    ) && account
-        .last_limit_state
-        .as_ref()
-        .is_some_and(|state| state.is_active(now))
+    ) && account_limit_kind_for_switch(account, now).is_some()
     {
         return false;
     }
 
     true
+}
+
+pub(crate) fn account_limit_kind_for_switch(
+    account: &StoredAccount,
+    now: DateTime<Utc>,
+) -> Option<StoredLimitKind> {
+    let state = account.last_limit_state.as_ref()?;
+    if !state.is_active(now) {
+        return None;
+    }
+    match state.kind {
+        StoredLimitKind::Exhausted => Some(StoredLimitKind::Exhausted),
+        StoredLimitKind::NearLimit => state
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| {
+                window_is_near_limit(snapshot.primary.as_ref()).then_some(state.kind)
+            }),
+    }
 }
 
 pub fn preferred_account_limit_snapshot(
@@ -141,10 +153,6 @@ pub fn preferred_account_limit_snapshot(
         .find(|snapshot| snapshot.limit_id.as_deref() == Some("codex"))
         .cloned()
         .or_else(|| snapshots.into_iter().next())
-}
-
-fn credits_are_exhausted(credits: &CreditsSnapshot) -> bool {
-    !credits.unlimited && !credits.has_credits
 }
 
 fn reached_type_is_exhausted(reached_type: RateLimitReachedType) -> bool {

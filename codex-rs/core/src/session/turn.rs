@@ -1008,7 +1008,8 @@ async fn run_sampling_request(
             }
             Err(CodexErr::UsageLimitReached(e)) => {
                 if let Some(rate_limits) = e.rate_limits.as_ref() {
-                    let rate_limits = (**rate_limits).clone();
+                    let mut rate_limits = (**rate_limits).clone();
+                    rate_limits.rate_limit_reached_type = e.rate_limit_reached_type;
                     sess.update_rate_limits(&turn_context, rate_limits.clone())
                         .await;
                     if let Err(err) = sess
@@ -1027,7 +1028,17 @@ async fn run_sampling_request(
                 {
                     warn!("failed to mark active account exhausted after usage limit: {err}");
                 }
-                let _ = maybe_switch_limited_account_for_next_request(&sess, &turn_context).await;
+                if let Some(account_id) =
+                    maybe_switch_limited_account_for_next_request(&sess, &turn_context).await
+                {
+                    *client_session = sess.services.model_client.new_session();
+                    let account = account_display_label(&sess, &account_id);
+                    info!(
+                        "switched active account after usage limit; retrying sampling request: {account}"
+                    );
+                    initial_input = Some(prompt.input.clone());
+                    continue;
+                }
                 return Err(CodexErr::UsageLimitReached(e));
             }
             Err(CodexErr::RefreshTokenFailed(e)) => {

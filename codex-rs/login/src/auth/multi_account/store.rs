@@ -400,9 +400,7 @@ impl AccountsStore {
             .accounts
             .iter()
             .find(|account| &account.account_id == active_account_id)
-            .and_then(|account| account.last_limit_state.as_ref())
-            .filter(|state| state.is_active(now))
-            .map(|state| state.kind))
+            .and_then(|account| selection::account_limit_kind_for_switch(account, now)))
     }
 
     pub fn mark_active_from_snapshot(
