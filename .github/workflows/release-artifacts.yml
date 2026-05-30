@@ -63,6 +63,38 @@ jobs:
           workspaces: codex-rs -> target
           key: ${{ matrix.name }}
 
+      - name: Resolve Codex npm version
+        id: npm-version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(npm view @openai/codex version --registry=https://registry.npmjs.org/)"
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "Using @openai/codex@${version}"
+
+      - name: Sync Rust version from npm
+        shell: bash
+        env:
+          CODEX_NPM_VERSION: ${{ steps.npm-version.outputs.version }}
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const fs = require("fs");
+
+          const version = process.env.CODEX_NPM_VERSION;
+          const path = "Cargo.toml";
+          const text = fs.readFileSync(path, "utf8");
+          const next = text.replace(
+            /(\[workspace\.package\]\s*\n)version = "[^"]+"/,
+            `$1version = "${version}"`,
+          );
+          if (next === text) {
+            throw new Error("failed to update workspace package version");
+          }
+          fs.writeFileSync(path, next);
+          NODE
+          grep '^version = ' Cargo.toml
+
       - name: Build release binary
         if: matrix.name == 'linux'
         env:
