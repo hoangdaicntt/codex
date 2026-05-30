@@ -1,0 +1,82 @@
+name: Release Artifacts
+
+on:
+  workflow_run:
+    workflows:
+      - CI
+    branches:
+      - main
+    types:
+      - completed
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_MIN_STACK: "8388608"
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux
+            runner: ubuntu-24.04
+            artifact: codex-linux
+            binary: codex
+          - name: macos
+            runner: macos-15
+            artifact: codex-macos
+            binary: codex
+          - name: windows
+            runner: windows-2025
+            artifact: codex-windows
+            binary: codex.exe
+    defaults:
+      run:
+        working-directory: codex-rs
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.ref }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: codex-rs -> target
+          key: ${{ matrix.name }}
+
+      - name: Build release binary
+        if: matrix.name == 'linux'
+        env:
+          CARGO_PROFILE_RELEASE_LTO: "false"
+          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+        run: cargo build --release -p codex-cli
+
+      - name: Build release binary
+        if: matrix.name != 'linux'
+        run: cargo build --release -p codex-cli
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: codex-rs/target/release/${{ matrix.binary }}
+          if-no-files-found: error
