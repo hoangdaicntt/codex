@@ -46,6 +46,17 @@ pub fn account_id_at_index(accounts: &[StoredAccount], index: usize) -> std::io:
     Ok(account.account_id.clone())
 }
 
+pub fn account_display_label(accounts: &[StoredAccount], account_id: &AccountId) -> Option<String> {
+    accounts
+        .iter()
+        .position(|account| &account.account_id == account_id)
+        .map(|offset| {
+            let index = offset + 1;
+            let email = accounts[offset].email.as_deref().unwrap_or("-");
+            format!("{index}. {email}")
+        })
+}
+
 fn display_row(
     index: usize,
     account: &StoredAccount,

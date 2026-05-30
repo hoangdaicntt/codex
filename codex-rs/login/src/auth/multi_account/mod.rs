@@ -5,6 +5,7 @@ mod store;
 mod token_refresh;
 
 pub use display::AccountDisplayRow;
+pub use display::account_display_label;
 pub use display::account_id_at_index;
 pub use display::display_rows;
 pub use metadata::AccountMetadata;

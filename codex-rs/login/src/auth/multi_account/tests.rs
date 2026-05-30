@@ -23,6 +23,7 @@ use crate::auth::multi_account::SelectionReason;
 use crate::auth::multi_account::StoredLimitKind;
 use crate::auth::multi_account::StoredLimitState;
 use crate::auth::multi_account::StoredRateLimitSnapshot;
+use crate::auth::multi_account::account_display_label;
 use crate::auth::multi_account::account_id_at_index;
 use crate::auth::multi_account::classify_rate_limit_snapshot;
 use crate::auth::multi_account::display_rows;
@@ -102,6 +103,21 @@ fn account_id_at_index_uses_one_based_indexes() -> anyhow::Result<()> {
     );
     assert!(account_id_at_index(&accounts, 0).is_err());
     assert!(account_id_at_index(&accounts, 3).is_err());
+    Ok(())
+}
+
+#[test]
+fn account_display_label_uses_one_based_index_and_email() -> anyhow::Result<()> {
+    let codex_home = tempdir()?;
+    let store = AccountsStore::new(codex_home.path().to_path_buf());
+    store.upsert_active_auth(chatgpt_auth("account-a", "a@example.com"))?;
+    store.upsert_active_auth(chatgpt_auth("account-b", "b@example.com"))?;
+    let accounts = store.load()?.accounts;
+
+    assert_eq!(
+        account_display_label(&accounts, &AccountId::from("account-b")),
+        Some("2. b@example.com".to_string())
+    );
     Ok(())
 }
 

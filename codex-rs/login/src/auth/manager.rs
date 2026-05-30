@@ -34,6 +34,7 @@ use super::multi_account::AccountsStore;
 use super::multi_account::SelectionReason;
 use super::multi_account::StoredAccount;
 use super::multi_account::StoredLimitKind;
+use super::multi_account::account_display_label;
 use super::multi_account::account_id_at_index;
 use super::multi_account::display_rows;
 use super::revoke::revoke_auth_tokens;
@@ -1499,6 +1500,14 @@ impl AuthManager {
         store.switch_active_account(&next_account_id, self.auth_credentials_store_mode)?;
         self.reload().await;
         Ok(Some(next_account_id.to_string()))
+    }
+
+    pub fn account_display_label(&self, account_id: &str) -> std::io::Result<Option<String>> {
+        let index = AccountsStore::new(self.codex_home.clone()).load()?;
+        Ok(account_display_label(
+            &index.accounts,
+            &AccountId::from(account_id),
+        ))
     }
 
     pub async fn switch_if_active_account_limited(&self) -> std::io::Result<Option<String>> {
