@@ -1,4 +1,4 @@
-name: Test and Build
+name: CI
 
 on:
   push:
@@ -8,9 +8,18 @@ on:
     branches:
       - main
   workflow_dispatch:
+    inputs:
+      build_linux_test_binary:
+        description: Build and upload a Linux debug test binary
+        type: boolean
+        default: false
 
 permissions:
   contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -30,6 +39,11 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: codex-rs -> target
+
       - name: Install nextest
         uses: taiki-e/install-action@v2
         with:
@@ -43,51 +57,10 @@ jobs:
       - name: Run tests
         run: just test -p codex-cli
 
-  build:
-    name: Build ${{ matrix.name }}
+  build-linux-test-binary:
+    name: Build linux test binary
     needs: test
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: linux
-            runner: ubuntu-24.04
-            artifact: codex-linux
-            binary: codex
-          - name: macos
-            runner: macos-15
-            artifact: codex-macos
-            binary: codex
-          - name: windows
-            runner: windows-2025
-            artifact: codex-windows
-            binary: codex.exe
-    defaults:
-      run:
-        working-directory: codex-rs
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Build release binary
-        run: cargo build --release -p codex-cli
-
-      - name: Upload binary
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.artifact }}
-          path: codex-rs/target/release/${{ matrix.binary }}
-          if-no-files-found: error
-
-  build-linux:
-    name: Build linux
-    needs: test
-    if: github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'workflow_dispatch' && inputs.build_linux_test_binary
     runs-on: ubuntu-24.04
     defaults:
       run:
@@ -99,12 +72,18 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: codex-rs -> target
+          key: linux-test-binary
+
       - name: Build binary
         run: cargo build -p codex-cli
 
       - name: Upload binary
         uses: actions/upload-artifact@v4
         with:
-          name: codex-linux
+          name: codex-linux-test
           path: codex-rs/target/debug/codex
           if-no-files-found: error
