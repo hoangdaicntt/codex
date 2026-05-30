@@ -13,6 +13,7 @@ use pretty_assertions::assert_eq;
 use tempfile::tempdir;
 
 use crate::auth::AuthDotJson;
+use crate::auth::AuthManager;
 use crate::auth::load_auth_dot_json;
 use crate::auth::multi_account::AccountId;
 use crate::auth::multi_account::AccountsIndex;
@@ -388,6 +389,42 @@ fn selection_skips_refresh_failed_accounts() -> anyhow::Result<()> {
     let next = store.next_available_account(SelectionReason::ProactiveNearLimit, None)?;
 
     assert_eq!(next, Some(AccountId::from("account-c")));
+    Ok(())
+}
+
+#[tokio::test]
+async fn switch_if_active_account_auth_failed_switches_to_next_account() -> anyhow::Result<()> {
+    let codex_home = tempdir()?;
+    let store = AccountsStore::new(codex_home.path().to_path_buf());
+    store.upsert_active_auth(chatgpt_auth("account-a", "a@example.com"))?;
+    store.upsert_active_auth(chatgpt_auth("account-b", "b@example.com"))?;
+    store.upsert_active_auth(chatgpt_auth("account-c", "c@example.com"))?;
+    store.switch_active_account(
+        &AccountId::from("account-b"),
+        AuthCredentialsStoreMode::File,
+    )?;
+    store.mark_active_refresh_failed(Some("refresh token already used".to_string()))?;
+    let manager = AuthManager::shared(
+        codex_home.path().to_path_buf(),
+        /*enable_codex_api_key_env*/ false,
+        AuthCredentialsStoreMode::File,
+        /*chatgpt_base_url*/ None,
+    )
+    .await;
+
+    let switched_account_id = manager.switch_if_active_account_auth_failed().await?;
+
+    assert_eq!(switched_account_id, Some("account-c".to_string()));
+    assert_eq!(
+        store.load()?.active_account_id,
+        Some(AccountId::from("account-c"))
+    );
+    let auth = load_auth_dot_json(codex_home.path(), AuthCredentialsStoreMode::File)?
+        .expect("active auth should be synced");
+    assert_eq!(
+        auth.tokens.and_then(|tokens| tokens.account_id),
+        Some("account-c".to_string())
+    );
     Ok(())
 }
 

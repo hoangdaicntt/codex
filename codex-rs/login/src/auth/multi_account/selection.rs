@@ -16,6 +16,7 @@ const NEAR_LIMIT_USED_PERCENT: f64 = 90.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SelectionReason {
+    AuthFailure,
     ProactiveNearLimit,
     UsageLimitReached,
     Manual,
