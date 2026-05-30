@@ -1,6 +1,5 @@
 use chrono::DateTime;
 use chrono::Utc;
-use codex_protocol::protocol::CreditsSnapshot;
 use codex_protocol::protocol::RateLimitReachedType;
 use codex_protocol::protocol::RateLimitSnapshot;
 use codex_protocol::protocol::RateLimitWindow;
@@ -30,19 +29,16 @@ pub enum LimitClassification {
 }
 
 pub fn classify_rate_limit_snapshot(snapshot: &RateLimitSnapshot) -> LimitClassification {
-    if snapshot.credits.as_ref().is_some_and(credits_are_exhausted)
-        || snapshot
-            .rate_limit_reached_type
-            .is_some_and(reached_type_is_exhausted)
+    if snapshot
+        .rate_limit_reached_type
+        .is_some_and(reached_type_is_exhausted)
     {
         return LimitClassification::Exhausted {
             resets_at: snapshot_reset_time(snapshot),
         };
     }
 
-    if window_is_near_limit(snapshot.primary.as_ref())
-        || window_is_near_limit(snapshot.secondary.as_ref())
-    {
+    if window_is_near_limit(snapshot.primary.as_ref()) {
         return LimitClassification::NearLimit {
             resets_at: snapshot_reset_time(snapshot),
         };
@@ -76,7 +72,9 @@ pub(crate) fn limit_state_from_snapshot(
 pub(crate) fn select_next_available_account(
     index: &AccountsIndex,
     active_account_id: &AccountId,
+    reason: SelectionReason,
     forced_workspace_ids: Option<&[String]>,
+    now: DateTime<Utc>,
 ) -> Option<AccountId> {
     let active_index = index
         .accounts
@@ -88,13 +86,15 @@ pub(crate) fn select_next_available_account(
         .cycle()
         .skip(active_index + 1)
         .take(index.accounts.len().saturating_sub(1))
-        .find(|account| account_is_eligible(account, forced_workspace_ids))
+        .find(|account| account_is_eligible(account, reason, forced_workspace_ids, now))
         .map(|account| account.account_id.clone())
 }
 
 fn account_is_eligible(
     account: &StoredAccount,
+    reason: SelectionReason,
     forced_workspace_ids: Option<&[String]>,
+    now: DateTime<Utc>,
 ) -> bool {
     if let Some(expected) = forced_workspace_ids
         && !account
@@ -113,11 +113,46 @@ fn account_is_eligible(
         return false;
     }
 
+    if matches!(
+        reason,
+        SelectionReason::AuthFailure
+            | SelectionReason::ProactiveNearLimit
+            | SelectionReason::UsageLimitReached
+    ) && account_limit_kind_for_switch(account, now).is_some()
+    {
+        return false;
+    }
+
     true
 }
 
-fn credits_are_exhausted(credits: &CreditsSnapshot) -> bool {
-    !credits.unlimited && !credits.has_credits
+pub(crate) fn account_limit_kind_for_switch(
+    account: &StoredAccount,
+    now: DateTime<Utc>,
+) -> Option<StoredLimitKind> {
+    let state = account.last_limit_state.as_ref()?;
+    if !state.is_active(now) {
+        return None;
+    }
+    match state.kind {
+        StoredLimitKind::Exhausted => Some(StoredLimitKind::Exhausted),
+        StoredLimitKind::NearLimit => state
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| {
+                window_is_near_limit(snapshot.primary.as_ref()).then_some(state.kind)
+            }),
+    }
+}
+
+pub fn preferred_account_limit_snapshot(
+    snapshots: Vec<RateLimitSnapshot>,
+) -> Option<RateLimitSnapshot> {
+    snapshots
+        .iter()
+        .find(|snapshot| snapshot.limit_id.as_deref() == Some("codex"))
+        .cloned()
+        .or_else(|| snapshots.into_iter().next())
 }
 
 fn reached_type_is_exhausted(reached_type: RateLimitReachedType) -> bool {

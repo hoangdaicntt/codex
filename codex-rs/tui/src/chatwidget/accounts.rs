@@ -4,14 +4,13 @@ use crate::app_event::AccountSwitchResult;
 use crate::bottom_pane::SelectionRowDisplay;
 use codex_backend_client::Client as BackendClient;
 use codex_login::AuthManager;
-use codex_login::RefreshTokenError;
 use codex_login::auth::multi_account::AccountId;
 use codex_login::auth::multi_account::AccountsIndex;
 use codex_login::auth::multi_account::AccountsStore;
 use codex_login::auth::multi_account::account_id_at_index;
 use codex_login::auth::multi_account::display_rows;
+use codex_login::auth::multi_account::preferred_account_limit_snapshot;
 use codex_model_provider::BearerAuthProvider;
-use codex_protocol::protocol::RateLimitSnapshot as CoreRateLimitSnapshot;
 use std::sync::Arc;
 
 const ACCOUNTS_SELECTION_VIEW_ID: &str = "accounts";
@@ -164,58 +163,30 @@ async fn refresh_account_limits_for_display(
     store: &AccountsStore,
     tx: Option<&crate::app_event_sender::AppEventSender>,
 ) {
-    let Ok(index) = store.load() else {
-        return;
-    };
-    let total = index.accounts.len();
-    if let Some(tx) = tx {
-        tx.send(AppEvent::AccountsPickerLoadProgress { loaded: 0, total });
-    }
-    for (offset, account) in index.accounts.into_iter().enumerate() {
-        let auth = match store
-            .resolve_account_auth_for_usage(
-                &account.account_id,
-                config.cli_auth_credentials_store_mode,
-            )
-            .await
-        {
-            Ok(Some(auth)) => auth,
-            Ok(None) => {
-                send_accounts_picker_progress(tx, offset + 1, total);
-                continue;
-            }
-            Err(RefreshTokenError::Permanent(err)) => {
-                let _ =
-                    store.mark_account_refresh_failed(&account.account_id, Some(err.to_string()));
-                send_accounts_picker_progress(tx, offset + 1, total);
-                continue;
-            }
-            Err(RefreshTokenError::Transient(_)) => {
-                send_accounts_picker_progress(tx, offset + 1, total);
-                continue;
-            }
-        };
-
-        let Ok(client) = BackendClient::new(config.chatgpt_base_url.clone()) else {
-            send_accounts_picker_progress(tx, offset + 1, total);
-            continue;
-        };
-        let client = client.with_auth_provider(Arc::new(BearerAuthProvider {
-            token: Some(auth.access_token),
-            account_id: Some(auth.account_id),
-            is_fedramp_account: auth.is_fedramp_account,
-        }));
-        let Ok(snapshots) = client.get_rate_limits_many().await else {
-            send_accounts_picker_progress(tx, offset + 1, total);
-            continue;
-        };
-        let Some(snapshot) = preferred_account_limit_snapshot(snapshots) else {
-            send_accounts_picker_progress(tx, offset + 1, total);
-            continue;
-        };
-        let _ = store.mark_account_rate_limits(&account.account_id, snapshot);
-        send_accounts_picker_progress(tx, offset + 1, total);
-    }
+    store
+        .refresh_account_limits_for_display(
+            config.cli_auth_credentials_store_mode,
+            |auth| {
+                let chatgpt_base_url = config.chatgpt_base_url.clone();
+                async move {
+                    let Ok(client) = BackendClient::new(chatgpt_base_url) else {
+                        return None;
+                    };
+                    let client = client.with_auth_provider(Arc::new(BearerAuthProvider {
+                        token: Some(auth.access_token),
+                        account_id: Some(auth.account_id),
+                        is_fedramp_account: auth.is_fedramp_account,
+                    }));
+                    client
+                        .get_rate_limits_many()
+                        .await
+                        .ok()
+                        .and_then(preferred_account_limit_snapshot)
+                }
+            },
+            |loaded, total| send_accounts_picker_progress(tx, loaded, total),
+        )
+        .await;
 }
 
 fn send_accounts_picker_progress(
@@ -226,16 +197,6 @@ fn send_accounts_picker_progress(
     if let Some(tx) = tx {
         tx.send(AppEvent::AccountsPickerLoadProgress { loaded, total });
     }
-}
-
-fn preferred_account_limit_snapshot(
-    snapshots: Vec<CoreRateLimitSnapshot>,
-) -> Option<CoreRateLimitSnapshot> {
-    snapshots
-        .iter()
-        .find(|snapshot| snapshot.limit_id.as_deref() == Some("codex"))
-        .cloned()
-        .or_else(|| snapshots.into_iter().next())
 }
 
 fn account_selection_params(

@@ -2812,7 +2812,7 @@ async fn rate_limit_event_switches_account_for_next_request() -> anyhow::Result<
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn usage_limit_error_switches_account_for_next_request_without_retry() -> anyhow::Result<()> {
+async fn usage_limit_error_switches_account_and_retries_request() -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
     let server = MockServer::start().await;
     let home = Arc::new(TempDir::new()?);
@@ -2846,26 +2846,8 @@ async fn usage_limit_error_switches_account_for_next_request_without_retry() -> 
         .with_home(home)
         .with_auth(create_dummy_codex_auth());
     let test = builder.build(&server).await?;
-    let codex = test.codex.clone();
 
-    codex
-        .submit(Op::UserInput {
-            environments: None,
-            items: vec![UserInput::Text {
-                text: "hit usage limit".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
-        .await?;
-    wait_for_event(&codex, |msg| matches!(msg, EventMsg::TurnStarted(_))).await;
-    wait_for_event(&codex, |msg| matches!(msg, EventMsg::Error(_))).await;
-    wait_for_event(&codex, |msg| matches!(msg, EventMsg::TurnComplete(_))).await;
-
-    test.submit_turn("after usage limit").await?;
+    test.submit_turn("hit usage limit").await?;
 
     let requests = responses_mock.requests();
     assert_eq!(requests.len(), 2);

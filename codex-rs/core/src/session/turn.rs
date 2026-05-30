@@ -961,15 +961,17 @@ async fn run_sampling_request(
             maybe_switch_auth_failed_account_for_next_request(&sess, &turn_context).await
         {
             *client_session = sess.services.model_client.new_session();
+            let account = account_display_label(&sess, &account_id);
             info!(
-                "switched active account before sampling request after auth failure: {account_id}"
+                "switched active account before sampling request after auth failure: {account}"
             );
         }
         if let Some(account_id) =
             maybe_switch_limited_account_for_next_request(&sess, &turn_context).await
         {
             *client_session = sess.services.model_client.new_session();
-            info!("switched active account before sampling request: {account_id}");
+            let account = account_display_label(&sess, &account_id);
+            info!("switched active account before sampling request: {account}");
         }
         let prompt_input = if let Some(input) = initial_input.take() {
             input
@@ -1006,7 +1008,8 @@ async fn run_sampling_request(
             }
             Err(CodexErr::UsageLimitReached(e)) => {
                 if let Some(rate_limits) = e.rate_limits.as_ref() {
-                    let rate_limits = (**rate_limits).clone();
+                    let mut rate_limits = (**rate_limits).clone();
+                    rate_limits.rate_limit_reached_type = e.rate_limit_reached_type;
                     sess.update_rate_limits(&turn_context, rate_limits.clone())
                         .await;
                     if let Err(err) = sess
@@ -1025,12 +1028,31 @@ async fn run_sampling_request(
                 {
                     warn!("failed to mark active account exhausted after usage limit: {err}");
                 }
-                let _ = maybe_switch_limited_account_for_next_request(&sess, &turn_context).await;
+                if let Some(account_id) =
+                    maybe_switch_limited_account_for_next_request(&sess, &turn_context).await
+                {
+                    *client_session = sess.services.model_client.new_session();
+                    let account = account_display_label(&sess, &account_id);
+                    info!(
+                        "switched active account after usage limit; retrying sampling request: {account}"
+                    );
+                    initial_input = Some(prompt.input.clone());
+                    continue;
+                }
                 return Err(CodexErr::UsageLimitReached(e));
             }
             Err(CodexErr::RefreshTokenFailed(e)) => {
-                let _ = maybe_switch_auth_failed_account_for_next_request(&sess, &turn_context)
-                    .await;
+                if let Some(account_id) =
+                    maybe_switch_auth_failed_account_for_next_request(&sess, &turn_context).await
+                {
+                    *client_session = sess.services.model_client.new_session();
+                    let account = account_display_label(&sess, &account_id);
+                    info!(
+                        "switched active account after auth refresh failure; retrying sampling request: {account}"
+                    );
+                    initial_input = Some(prompt.input.clone());
+                    continue;
+                }
                 return Err(CodexErr::RefreshTokenFailed(e));
             }
             Err(err) => err,
@@ -1064,11 +1086,12 @@ async fn maybe_switch_limited_account_for_next_request(
         .await
     {
         Ok(Some(account_id)) => {
+            let account = account_display_label(sess, &account_id);
             sess.send_event(
                 turn_context,
                 EventMsg::Warning(WarningEvent {
                     message: format!(
-                        "Switched active ChatGPT account to {account_id} for the next request because the previous account is near or at its usage limit."
+                        "Switched active ChatGPT account to {account} for the next request because the previous account is near or at its usage limit."
                     ),
                 }),
             )
@@ -1094,11 +1117,12 @@ async fn maybe_switch_auth_failed_account_for_next_request(
         .await
     {
         Ok(Some(account_id)) => {
+            let account = account_display_label(sess, &account_id);
             sess.send_event(
                 turn_context,
                 EventMsg::Warning(WarningEvent {
                     message: format!(
-                        "Switched active ChatGPT account to {account_id} for the next request because the previous account could not refresh its token."
+                        "Switched active ChatGPT account to {account} and retrying because the previous account could not refresh its token."
                     ),
                 }),
             )
@@ -1111,6 +1135,15 @@ async fn maybe_switch_auth_failed_account_for_next_request(
             None
         }
     }
+}
+
+fn account_display_label(sess: &Session, account_id: &str) -> String {
+    sess.services
+        .auth_manager
+        .account_display_label(account_id)
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| account_id.to_string())
 }
 
 #[expect(

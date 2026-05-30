@@ -76,16 +76,15 @@ use codex_features::Stage;
 use codex_features::is_known_feature_key;
 use codex_login::AuthManager;
 use codex_login::CodexAuth;
-use codex_login::RefreshTokenError;
 use codex_login::auth::multi_account::AccountsStore;
 use codex_login::auth::multi_account::account_id_at_index;
 use codex_login::auth::multi_account::display_rows;
+use codex_login::auth::multi_account::preferred_account_limit_snapshot;
 use codex_login::read_codex_access_token_from_env;
 use codex_memories_write::clear_memory_roots_contents;
 use codex_models_manager::bundled_models_response;
 use codex_models_manager::manager::RefreshStrategy;
 use codex_protocol::protocol::AskForApproval;
-use codex_protocol::protocol::RateLimitSnapshot;
 use codex_protocol::user_input::UserInput;
 use codex_model_provider::BearerAuthProvider;
 use codex_terminal_detection::TerminalName;
@@ -1760,51 +1759,30 @@ async fn refresh_account_limits_for_display(
     config: &codex_core::config::Config,
     store: &AccountsStore,
 ) {
-    let Ok(index) = store.load() else {
-        return;
-    };
-    for account in index.accounts {
-        let auth = match store
-            .resolve_account_auth_for_usage(
-                &account.account_id,
-                config.cli_auth_credentials_store_mode,
-            )
-            .await
-        {
-            Ok(Some(auth)) => auth,
-            Ok(None) => continue,
-            Err(RefreshTokenError::Permanent(err)) => {
-                let _ =
-                    store.mark_account_refresh_failed(&account.account_id, Some(err.to_string()));
-                continue;
-            }
-            Err(RefreshTokenError::Transient(_)) => continue,
-        };
-
-        let Ok(client) = BackendClient::new(config.chatgpt_base_url.clone()) else {
-            continue;
-        };
-        let client = client.with_auth_provider(Arc::new(BearerAuthProvider {
-            token: Some(auth.access_token),
-            account_id: Some(auth.account_id),
-            is_fedramp_account: auth.is_fedramp_account,
-        }));
-        let Ok(snapshots) = client.get_rate_limits_many().await else {
-            continue;
-        };
-        let Some(snapshot) = preferred_account_limit_snapshot(snapshots) else {
-            continue;
-        };
-        let _ = store.mark_account_rate_limits(&account.account_id, snapshot);
-    }
-}
-
-fn preferred_account_limit_snapshot(snapshots: Vec<RateLimitSnapshot>) -> Option<RateLimitSnapshot> {
-    snapshots
-        .iter()
-        .find(|snapshot| snapshot.limit_id.as_deref() == Some("codex"))
-        .cloned()
-        .or_else(|| snapshots.into_iter().next())
+    store
+        .refresh_account_limits_for_display(
+            config.cli_auth_credentials_store_mode,
+            |auth| {
+                let chatgpt_base_url = config.chatgpt_base_url.clone();
+                async move {
+                    let Ok(client) = BackendClient::new(chatgpt_base_url) else {
+                        return None;
+                    };
+                    let client = client.with_auth_provider(Arc::new(BearerAuthProvider {
+                        token: Some(auth.access_token),
+                        account_id: Some(auth.account_id),
+                        is_fedramp_account: auth.is_fedramp_account,
+                    }));
+                    client
+                        .get_rate_limits_many()
+                        .await
+                        .ok()
+                        .and_then(preferred_account_limit_snapshot)
+                }
+            },
+            |_, _| {},
+        )
+        .await;
 }
 
 async fn load_cli_config(
