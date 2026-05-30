@@ -76,7 +76,9 @@ pub(crate) fn limit_state_from_snapshot(
 pub(crate) fn select_next_available_account(
     index: &AccountsIndex,
     active_account_id: &AccountId,
+    reason: SelectionReason,
     forced_workspace_ids: Option<&[String]>,
+    now: DateTime<Utc>,
 ) -> Option<AccountId> {
     let active_index = index
         .accounts
@@ -88,13 +90,15 @@ pub(crate) fn select_next_available_account(
         .cycle()
         .skip(active_index + 1)
         .take(index.accounts.len().saturating_sub(1))
-        .find(|account| account_is_eligible(account, forced_workspace_ids))
+        .find(|account| account_is_eligible(account, reason, forced_workspace_ids, now))
         .map(|account| account.account_id.clone())
 }
 
 fn account_is_eligible(
     account: &StoredAccount,
+    reason: SelectionReason,
     forced_workspace_ids: Option<&[String]>,
+    now: DateTime<Utc>,
 ) -> bool {
     if let Some(expected) = forced_workspace_ids
         && !account
@@ -113,7 +117,30 @@ fn account_is_eligible(
         return false;
     }
 
+    if matches!(
+        reason,
+        SelectionReason::AuthFailure
+            | SelectionReason::ProactiveNearLimit
+            | SelectionReason::UsageLimitReached
+    ) && account
+        .last_limit_state
+        .as_ref()
+        .is_some_and(|state| state.is_active(now))
+    {
+        return false;
+    }
+
     true
+}
+
+pub fn preferred_account_limit_snapshot(
+    snapshots: Vec<RateLimitSnapshot>,
+) -> Option<RateLimitSnapshot> {
+    snapshots
+        .iter()
+        .find(|snapshot| snapshot.limit_id.as_deref() == Some("codex"))
+        .cloned()
+        .or_else(|| snapshots.into_iter().next())
 }
 
 fn credits_are_exhausted(credits: &CreditsSnapshot) -> bool {

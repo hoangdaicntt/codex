@@ -238,7 +238,7 @@ fn remove_last_account_clears_active_auth() -> anyhow::Result<()> {
 }
 
 #[test]
-fn selection_uses_next_picker_account_even_when_exhausted() -> anyhow::Result<()> {
+fn auto_selection_skips_exhausted_accounts() -> anyhow::Result<()> {
     let codex_home = tempdir()?;
     let store = AccountsStore::new(codex_home.path().to_path_buf());
     store.upsert_active_auth(chatgpt_auth("account-a", "a@example.com"))?;
@@ -260,12 +260,12 @@ fn selection_uses_next_picker_account_even_when_exhausted() -> anyhow::Result<()
 
     let next = store.next_available_account(SelectionReason::ProactiveNearLimit, None)?;
 
-    assert_eq!(next, Some(AccountId::from("account-b")));
+    assert_eq!(next, Some(AccountId::from("account-c")));
     Ok(())
 }
 
 #[test]
-fn selection_uses_next_picker_account_even_when_near_limit() -> anyhow::Result<()> {
+fn auto_selection_skips_near_limit_accounts() -> anyhow::Result<()> {
     let codex_home = tempdir()?;
     let store = AccountsStore::new(codex_home.path().to_path_buf());
     store.upsert_active_auth(chatgpt_auth("account-a", "a@example.com"))?;
@@ -282,6 +282,29 @@ fn selection_uses_next_picker_account_even_when_near_limit() -> anyhow::Result<(
     )?;
 
     let next = store.next_available_account(SelectionReason::ProactiveNearLimit, None)?;
+
+    assert_eq!(next, Some(AccountId::from("account-c")));
+    Ok(())
+}
+
+#[test]
+fn manual_selection_uses_next_picker_account_even_when_limited() -> anyhow::Result<()> {
+    let codex_home = tempdir()?;
+    let store = AccountsStore::new(codex_home.path().to_path_buf());
+    store.upsert_active_auth(chatgpt_auth("account-a", "a@example.com"))?;
+    store.upsert_active_auth(chatgpt_auth("account-b", "b@example.com"))?;
+    store.upsert_active_auth(chatgpt_auth("account-c", "c@example.com"))?;
+    store.switch_active_account(
+        &AccountId::from("account-b"),
+        AuthCredentialsStoreMode::File,
+    )?;
+    store.mark_active_from_snapshot(snapshot(Some(95.0), None, None, None))?;
+    store.switch_active_account(
+        &AccountId::from("account-a"),
+        AuthCredentialsStoreMode::File,
+    )?;
+
+    let next = store.next_available_account(SelectionReason::Manual, None)?;
 
     assert_eq!(next, Some(AccountId::from("account-b")));
     Ok(())
@@ -520,6 +543,26 @@ fn mark_active_from_snapshot_stores_near_limit() -> anyhow::Result<()> {
             .map(|state| state.kind),
         Some(StoredLimitKind::NearLimit)
     );
+    Ok(())
+}
+
+#[test]
+fn mark_account_rate_limits_updates_selection_state() -> anyhow::Result<()> {
+    let codex_home = tempdir()?;
+    let store = AccountsStore::new(codex_home.path().to_path_buf());
+    let account_id = store.upsert_active_auth(chatgpt_auth("account-a", "a@example.com"))?;
+
+    store.mark_account_rate_limits(&account_id, snapshot(Some(95.0), None, None, None))?;
+
+    let index = store.load()?;
+    assert_eq!(
+        index.accounts[0]
+            .last_limit_state
+            .as_ref()
+            .map(|state| state.kind),
+        Some(StoredLimitKind::NearLimit)
+    );
+    assert!(index.accounts[0].last_rate_limits.is_some());
     Ok(())
 }
 

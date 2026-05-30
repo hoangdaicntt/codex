@@ -378,10 +378,13 @@ impl AccountsStore {
         else {
             return Ok(());
         };
+        let now = Utc::now();
+        let limit_state = selection::limit_state_from_snapshot(snapshot.clone(), now);
         account.last_rate_limits = Some(StoredRateLimitSnapshot {
-            recorded_at: Utc::now(),
+            recorded_at: now,
             snapshot,
         });
+        account.last_limit_state = limit_state;
         self.save(&index)
     }
 
@@ -506,7 +509,7 @@ impl AccountsStore {
 
     pub fn next_available_account(
         &self,
-        _reason: SelectionReason,
+        reason: SelectionReason,
         forced_workspace_ids: Option<&[String]>,
     ) -> std::io::Result<Option<AccountId>> {
         let index = self.load()?;
@@ -516,7 +519,9 @@ impl AccountsStore {
         Ok(selection::select_next_available_account(
             &index,
             active_account_id,
+            reason,
             forced_workspace_ids,
+            Utc::now(),
         ))
     }
 }

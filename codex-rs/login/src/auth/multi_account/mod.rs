@@ -11,6 +11,7 @@ pub use metadata::AccountMetadata;
 pub use selection::LimitClassification;
 pub use selection::SelectionReason;
 pub use selection::classify_rate_limit_snapshot;
+pub use selection::preferred_account_limit_snapshot;
 pub use store::AccountId;
 pub use store::AccountsIndex;
 pub use store::AccountsStore;
