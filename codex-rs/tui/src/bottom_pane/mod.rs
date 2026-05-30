@@ -1151,6 +1151,16 @@ impl BottomPane {
             .and_then(|view| view.selected_index())
     }
 
+    pub(crate) fn selected_item_is_enabled_for_active_view(
+        &self,
+        view_id: &'static str,
+    ) -> Option<bool> {
+        self.view_stack
+            .last()
+            .filter(|view| view.view_id() == Some(view_id))
+            .and_then(|view| view.selected_item_is_enabled())
+    }
+
     pub(crate) fn active_tab_id_for_active_view(&self, view_id: &'static str) -> Option<&str> {
         self.view_stack
             .last()

@@ -385,6 +385,9 @@ impl ChatWidget {
                     );
                 }
             }
+            SlashCommand::Accounts => {
+                self.open_accounts_picker();
+            }
             SlashCommand::Ide => {
                 self.handle_ide_command();
             }
@@ -978,6 +981,7 @@ impl ChatWidget {
             | SlashCommand::Mention
             | SlashCommand::Skills
             | SlashCommand::Hooks
+            | SlashCommand::Accounts
             | SlashCommand::Title
             | SlashCommand::Statusline
             | SlashCommand::Theme

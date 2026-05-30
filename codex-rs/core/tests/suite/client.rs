@@ -1,3 +1,4 @@
+use codex_app_server_protocol::AuthMode;
 use codex_config::ConfigLayerStack;
 use codex_config::types::AuthCredentialsStoreMode;
 use codex_core::ModelClient;
@@ -9,9 +10,14 @@ use codex_core::resolve_installation_id;
 use codex_core::thread_store_from_config;
 use codex_extension_api::empty_extension_registry;
 use codex_features::Feature;
+use codex_login::AuthDotJson;
 use codex_login::AuthManager;
 use codex_login::CodexAuth;
+use codex_login::TokenData;
+use codex_login::auth::multi_account::AccountsStore;
+use codex_login::auth::multi_account::StoredLimitKind;
 use codex_login::default_client::originator;
+use codex_login::token_data::IdTokenInfo;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::WireApi;
 use codex_model_provider_info::built_in_model_providers;
@@ -58,11 +64,13 @@ use core_test_support::responses::ev_completed_with_tokens;
 use core_test_support::responses::ev_message_item_added;
 use core_test_support::responses::ev_output_text_delta;
 use core_test_support::responses::ev_response_created;
+use core_test_support::responses::mount_response_sequence;
 use core_test_support::responses::mount_sse_once;
 use core_test_support::responses::mount_sse_once_match;
 use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::sse;
 use core_test_support::responses::sse_failed;
+use core_test_support::responses::sse_response;
 use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::TestCodex;
 use core_test_support::test_codex::test_codex;
@@ -161,6 +169,51 @@ fn write_auth_json(
     .unwrap();
 
     fake_jwt
+}
+
+fn chatgpt_auth_for_account(account_id: &str, access_token: &str) -> AuthDotJson {
+    let raw_jwt = jwt_for_account(account_id);
+    AuthDotJson {
+        auth_mode: Some(AuthMode::Chatgpt),
+        openai_api_key: None,
+        tokens: Some(TokenData {
+            id_token: IdTokenInfo {
+                email: Some(format!("{account_id}@example.com")),
+                chatgpt_account_id: Some(account_id.to_string()),
+                raw_jwt,
+                ..Default::default()
+            },
+            access_token: access_token.to_string(),
+            refresh_token: format!("refresh-{account_id}"),
+            account_id: Some(account_id.to_string()),
+        }),
+        last_refresh: Some(chrono::Utc::now()),
+        agent_identity: None,
+    }
+}
+
+#[expect(clippy::unwrap_used)]
+fn jwt_for_account(account_id: &str) -> String {
+    use base64::Engine as _;
+
+    let b64 = |bytes: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+    let header_b64 = b64(br#"{"alg":"none","typ":"JWT"}"#);
+    let payload_b64 = b64(serde_json::to_string(&json!({
+        "email": format!("{account_id}@example.com"),
+        "https://api.openai.com/auth": {
+            "chatgpt_account_id": account_id
+        }
+    }))
+    .unwrap()
+    .as_bytes());
+    format!("{header_b64}.{payload_b64}.sig")
+}
+
+fn write_multi_account_store(codex_home: &std::path::Path) -> anyhow::Result<()> {
+    let store = AccountsStore::new(codex_home.to_path_buf());
+    store.upsert_active_auth(chatgpt_auth_for_account("account-b", "access-account-b"))?;
+    store.upsert_active_auth(chatgpt_auth_for_account("account_id", "access-account-a"))?;
+    Ok(())
 }
 
 struct ProviderAuthCommandFixture {
@@ -2692,6 +2745,123 @@ async fn usage_limit_error_emits_rate_limit_event() -> anyhow::Result<()> {
         error_event.message.to_lowercase().contains("usage limit"),
         "unexpected error message for submission {submission_id}: {}",
         error_event.message
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rate_limit_event_switches_account_for_next_request() -> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+    let server = MockServer::start().await;
+    let home = Arc::new(TempDir::new()?);
+    write_multi_account_store(home.path())?;
+
+    let responses_mock = mount_response_sequence(
+        &server,
+        vec![
+            sse_response(sse(vec![
+                ev_response_created("resp-near-limit"),
+                ev_completed("resp-near-limit"),
+            ]))
+            .insert_header("x-codex-primary-used-percent", "95.0")
+            .insert_header("x-codex-primary-window-minutes", "60")
+            .insert_header("x-codex-primary-reset-at", "2000000000"),
+            sse_response(sse(vec![
+                ev_response_created("resp-after-switch"),
+                ev_completed("resp-after-switch"),
+            ])),
+        ],
+    )
+    .await;
+
+    let mut builder = test_codex()
+        .with_home(home)
+        .with_auth(create_dummy_codex_auth());
+    let test = builder.build(&server).await?;
+
+    test.submit_turn("first turn").await?;
+    let index = AccountsStore::new(test.codex_home_path().to_path_buf()).load()?;
+    assert_eq!(
+        index
+            .accounts
+            .iter()
+            .find(|account| account.account_id.as_str() == "account_id")
+            .and_then(|account| account.last_limit_state.as_ref())
+            .map(|state| state.kind),
+        Some(StoredLimitKind::NearLimit)
+    );
+    test.submit_turn("after near limit").await?;
+
+    let requests = responses_mock.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        requests[0].header("authorization").as_deref(),
+        Some("Bearer Access Token")
+    );
+    assert_eq!(
+        requests[1].header("authorization").as_deref(),
+        Some("Bearer access-account-b")
+    );
+    assert_eq!(
+        requests[1].header("chatgpt-account-id").as_deref(),
+        Some("account-b")
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn usage_limit_error_switches_account_and_retries_request() -> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+    let server = MockServer::start().await;
+    let home = Arc::new(TempDir::new()?);
+    write_multi_account_store(home.path())?;
+
+    let usage_limit_response = ResponseTemplate::new(429)
+        .insert_header("x-codex-primary-used-percent", "100.0")
+        .insert_header("x-codex-primary-window-minutes", "15")
+        .set_body_json(json!({
+            "error": {
+                "type": "usage_limit_reached",
+                "message": "limit reached",
+                "resets_at": 2000000000,
+                "plan_type": "pro"
+            }
+        }));
+
+    let responses_mock = mount_response_sequence(
+        &server,
+        vec![
+            usage_limit_response,
+            sse_response(sse(vec![
+                ev_response_created("resp-after-usage-limit"),
+                ev_completed("resp-after-usage-limit"),
+            ])),
+        ],
+    )
+    .await;
+
+    let mut builder = test_codex()
+        .with_home(home)
+        .with_auth(create_dummy_codex_auth());
+    let test = builder.build(&server).await?;
+
+    test.submit_turn("hit usage limit").await?;
+
+    let requests = responses_mock.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        requests[0].header("authorization").as_deref(),
+        Some("Bearer Access Token")
+    );
+    assert_eq!(
+        requests[1].header("authorization").as_deref(),
+        Some("Bearer access-account-b")
+    );
+    assert_eq!(
+        requests[1].header("chatgpt-account-id").as_deref(),
+        Some("account-b")
     );
 
     Ok(())

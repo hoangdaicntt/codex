@@ -8,6 +8,7 @@ use codex_app_server_daemon::LifecycleCommand as AppServerLifecycleCommand;
 use codex_app_server_daemon::RemoteControlMode as AppServerRemoteControlMode;
 use codex_arg0::Arg0DispatchPaths;
 use codex_arg0::arg0_dispatch_or_else;
+use codex_backend_client::Client as BackendClient;
 use codex_chatgpt::apply_command::ApplyCommand;
 use codex_chatgpt::apply_command::run_apply_command;
 use codex_cli::read_access_token_from_stdin;
@@ -38,7 +39,9 @@ use codex_utils_cli::ProfileV2Name;
 use codex_utils_cli::resume_hint;
 use owo_colors::OwoColorize;
 use std::io::IsTerminal;
+use std::io::Write;
 use std::path::PathBuf;
+use std::sync::Arc;
 use supports_color::Stream;
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -73,12 +76,17 @@ use codex_features::Stage;
 use codex_features::is_known_feature_key;
 use codex_login::AuthManager;
 use codex_login::CodexAuth;
+use codex_login::auth::multi_account::AccountsStore;
+use codex_login::auth::multi_account::account_id_at_index;
+use codex_login::auth::multi_account::display_rows;
+use codex_login::auth::multi_account::preferred_account_limit_snapshot;
 use codex_login::read_codex_access_token_from_env;
 use codex_memories_write::clear_memory_roots_contents;
 use codex_models_manager::bundled_models_response;
 use codex_models_manager::manager::RefreshStrategy;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::user_input::UserInput;
+use codex_model_provider::BearerAuthProvider;
 use codex_terminal_detection::TerminalName;
 
 /// Codex CLI
@@ -124,6 +132,13 @@ enum Subcommand {
 
     /// Manage login.
     Login(LoginCommand),
+
+    /// Manage saved ChatGPT accounts.
+    Accounts(AccountsCommand),
+
+    /// Removed. Use `codex accounts`.
+    #[clap(name = "account", hide = true)]
+    RemovedAccount(RemovedAccountCommand),
 
     /// Remove stored authentication credentials.
     Logout(LogoutCommand),
@@ -426,6 +441,15 @@ enum LoginSubcommand {
     /// Show login status.
     Status,
 }
+
+#[derive(Debug, Parser)]
+struct AccountsCommand {
+    #[clap(skip)]
+    config_overrides: CliConfigOverrides,
+}
+
+#[derive(Debug, Parser)]
+struct RemovedAccountCommand {}
 
 #[derive(Debug, Parser)]
 struct LogoutCommand {
@@ -1194,6 +1218,21 @@ async fn cli_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
                 }
             }
         }
+        Some(Subcommand::Accounts(mut accounts_cli)) => {
+            reject_remote_mode_for_subcommand(
+                root_remote.as_deref(),
+                root_remote_auth_token_env.as_deref(),
+                "accounts",
+            )?;
+            prepend_config_flags(
+                &mut accounts_cli.config_overrides,
+                root_config_overrides.clone(),
+            );
+            run_accounts_command(accounts_cli).await?;
+        }
+        Some(Subcommand::RemovedAccount(_)) => {
+            anyhow::bail!("`codex account` has been removed. Use `codex accounts`.");
+        }
         Some(Subcommand::Logout(mut logout_cli)) => {
             reject_remote_mode_for_subcommand(
                 root_remote.as_deref(),
@@ -1631,6 +1670,133 @@ async fn load_exec_server_remote_auth(
     Ok(auth)
 }
 
+async fn run_accounts_command(cmd: AccountsCommand) -> anyhow::Result<()> {
+    let config = load_cli_config(&cmd.config_overrides).await?;
+    let auth_manager =
+        AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false).await;
+    let store = AccountsStore::new(config.codex_home.to_path_buf());
+    store.import_active_auth_if_missing(config.cli_auth_credentials_store_mode)?;
+    refresh_account_limits_for_display(&config, &store).await;
+
+    let accounts_index = store.load()?;
+    let rows = display_rows(
+        &accounts_index.accounts,
+        accounts_index.active_account_id.as_ref(),
+        chrono::Utc::now(),
+    );
+    if rows.is_empty() {
+        println!("No saved ChatGPT accounts.");
+        return Ok(());
+    }
+
+    for row in &rows {
+        println!("{}", row.line);
+    }
+
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        return Ok(());
+    }
+
+    print!("Select account index, d <index> to remove, or press Enter to keep current: ");
+    std::io::stdout().flush()?;
+
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input)?;
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+
+    if let Some(index_text) = trimmed.strip_prefix("d ") {
+        let index: usize = index_text
+            .trim()
+            .parse()
+            .map_err(|_| anyhow::anyhow!("account index must be a positive number"))?;
+        let account_id = account_id_at_index(&accounts_index.accounts, index)?;
+        let outcome = store.remove_account(
+            &account_id,
+            config.cli_auth_credentials_store_mode,
+        )?;
+        auth_manager.reload().await;
+        let removed_email = outcome
+            .removed_account
+            .email
+            .as_deref()
+            .unwrap_or("-");
+        match outcome.new_active_account.as_ref() {
+            Some(active_account) if outcome.active_account_changed => {
+                let active_email = active_account.email.as_deref().unwrap_or("-");
+                println!("Removed account {removed_email}. Active account is now {active_email}.");
+            }
+            Some(_) => {
+                println!("Removed account {removed_email}.");
+            }
+            None if outcome.active_account_changed => {
+                println!("Removed account {removed_email}. No saved ChatGPT accounts.");
+            }
+            None => {
+                println!("Removed account {removed_email}.");
+            }
+        }
+        return Ok(());
+    }
+
+    let index: usize = trimmed
+        .parse()
+        .map_err(|_| anyhow::anyhow!("account index must be a positive number"))?;
+    let email = accounts_index
+        .accounts
+        .get(index.saturating_sub(1))
+        .and_then(|account| account.email.clone())
+        .unwrap_or_else(|| "-".to_string());
+    auth_manager.switch_account_by_index(index).await?;
+    println!("Switched active account to {index}. {email}.");
+
+    Ok(())
+}
+
+async fn refresh_account_limits_for_display(
+    config: &codex_core::config::Config,
+    store: &AccountsStore,
+) {
+    store
+        .refresh_account_limits_for_display(
+            config.cli_auth_credentials_store_mode,
+            |auth| {
+                let chatgpt_base_url = config.chatgpt_base_url.clone();
+                async move {
+                    let Ok(client) = BackendClient::new(chatgpt_base_url) else {
+                        return None;
+                    };
+                    let client = client.with_auth_provider(Arc::new(BearerAuthProvider {
+                        token: Some(auth.access_token),
+                        account_id: Some(auth.account_id),
+                        is_fedramp_account: auth.is_fedramp_account,
+                    }));
+                    client
+                        .get_rate_limits_many()
+                        .await
+                        .ok()
+                        .and_then(preferred_account_limit_snapshot)
+                }
+            },
+            |_, _| {},
+        )
+        .await;
+}
+
+async fn load_cli_config(
+    config_overrides: &CliConfigOverrides,
+) -> anyhow::Result<codex_core::config::Config> {
+    let cli_kv_overrides = config_overrides
+        .parse_overrides()
+        .map_err(anyhow::Error::msg)?;
+    Ok(ConfigBuilder::default()
+        .cli_overrides(cli_kv_overrides)
+        .build()
+        .await?)
+}
+
 async fn enable_feature_in_config(feature: &str) -> anyhow::Result<()> {
     FeatureToggles::validate_feature(feature)?;
     let codex_home = find_codex_home()?;
@@ -1902,6 +2068,8 @@ fn unsupported_subcommand_name_for_strict_config(
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         Some(Subcommand::App(_)) => Some("app"),
         Some(Subcommand::Login(_)) => Some("login"),
+        Some(Subcommand::Accounts(_)) => Some("accounts"),
+        Some(Subcommand::RemovedAccount(_)) => Some("account"),
         Some(Subcommand::Logout(_)) => Some("logout"),
         Some(Subcommand::Completion(_)) => Some("completion"),
         Some(Subcommand::Update) => Some("update"),
@@ -2648,6 +2816,25 @@ mod tests {
             .expect_err("parse should fail");
 
         assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn account_commands_parse() {
+        let cli = MultitoolCli::try_parse_from(["codex", "accounts"]).expect("parse");
+        assert_matches!(
+            cli.subcommand,
+            Some(Subcommand::Accounts(AccountsCommand { .. }))
+        );
+
+        let cli = MultitoolCli::try_parse_from(["codex", "account"]).expect("parse blocker");
+        assert_matches!(
+            cli.subcommand,
+            Some(Subcommand::RemovedAccount(RemovedAccountCommand {}))
+        );
+
+        let err = MultitoolCli::try_parse_from(["codex", "accounts", "list"])
+            .expect_err("account subcommands should be removed");
+        assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
     }
 
     #[test]

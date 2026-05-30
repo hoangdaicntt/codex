@@ -465,9 +465,13 @@ impl TestCodexBuilder {
         let state_db = codex_core::init_state_db(&config).await;
         let thread_store = thread_store_from_config(&config, state_db.clone());
         let installation_id = resolve_installation_id(&config.codex_home).await?;
+        let auth_manager = codex_core::test_support::auth_manager_from_auth_with_home(
+            auth.clone(),
+            home.path().to_path_buf(),
+        );
         let thread_manager = ThreadManager::new(
             &config,
-            codex_core::test_support::auth_manager_from_auth(auth.clone()),
+            auth_manager,
             SessionSource::Exec,
             Arc::clone(&environment_manager),
             empty_extension_registry(),
@@ -482,7 +486,10 @@ impl TestCodexBuilder {
 
         let new_conversation = match (resume_from, user_shell_override) {
             (Some(path), Some(user_shell_override)) => {
-                let auth_manager = codex_core::test_support::auth_manager_from_auth(auth);
+                let auth_manager = codex_core::test_support::auth_manager_from_auth_with_home(
+                    auth,
+                    home.path().to_path_buf(),
+                );
                 Box::pin(
                     codex_core::test_support::resume_thread_from_rollout_with_user_shell_override(
                         thread_manager.as_ref(),
@@ -495,7 +502,10 @@ impl TestCodexBuilder {
                 .await?
             }
             (Some(path), None) => {
-                let auth_manager = codex_core::test_support::auth_manager_from_auth(auth);
+                let auth_manager = codex_core::test_support::auth_manager_from_auth_with_home(
+                    auth,
+                    home.path().to_path_buf(),
+                );
                 Box::pin(thread_manager.resume_thread_from_rollout(
                     config.clone(),
                     path,

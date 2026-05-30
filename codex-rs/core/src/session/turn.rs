@@ -957,6 +957,22 @@ async fn run_sampling_request(
     let mut retries = 0;
     let mut initial_input = Some(input);
     loop {
+        if let Some(account_id) =
+            maybe_switch_auth_failed_account_for_next_request(&sess, &turn_context).await
+        {
+            *client_session = sess.services.model_client.new_session();
+            let account = account_display_label(&sess, &account_id);
+            info!(
+                "switched active account before sampling request after auth failure: {account}"
+            );
+        }
+        if let Some(account_id) =
+            maybe_switch_limited_account_for_next_request(&sess, &turn_context).await
+        {
+            *client_session = sess.services.model_client.new_session();
+            let account = account_display_label(&sess, &account_id);
+            info!("switched active account before sampling request: {account}");
+        }
         let prompt_input = if let Some(input) = initial_input.take() {
             input
         } else {
@@ -991,11 +1007,53 @@ async fn run_sampling_request(
                 return Err(CodexErr::ContextWindowExceeded);
             }
             Err(CodexErr::UsageLimitReached(e)) => {
-                let rate_limits = e.rate_limits.clone();
-                if let Some(rate_limits) = rate_limits {
-                    sess.update_rate_limits(&turn_context, *rate_limits).await;
+                if let Some(rate_limits) = e.rate_limits.as_ref() {
+                    let mut rate_limits = (**rate_limits).clone();
+                    rate_limits.rate_limit_reached_type = e.rate_limit_reached_type;
+                    sess.update_rate_limits(&turn_context, rate_limits.clone())
+                        .await;
+                    if let Err(err) = sess
+                        .services
+                        .auth_manager
+                        .mark_active_account_exhausted_from_snapshot(rate_limits, e.resets_at)
+                    {
+                        warn!(
+                            "failed to mark active account exhausted from rate limit snapshot: {err}"
+                        );
+                    }
+                } else if let Err(err) = sess
+                    .services
+                    .auth_manager
+                    .mark_active_account_exhausted(e.resets_at)
+                {
+                    warn!("failed to mark active account exhausted after usage limit: {err}");
+                }
+                if let Some(account_id) =
+                    maybe_switch_limited_account_for_next_request(&sess, &turn_context).await
+                {
+                    *client_session = sess.services.model_client.new_session();
+                    let account = account_display_label(&sess, &account_id);
+                    info!(
+                        "switched active account after usage limit; retrying sampling request: {account}"
+                    );
+                    initial_input = Some(prompt.input.clone());
+                    continue;
                 }
                 return Err(CodexErr::UsageLimitReached(e));
+            }
+            Err(CodexErr::RefreshTokenFailed(e)) => {
+                if let Some(account_id) =
+                    maybe_switch_auth_failed_account_for_next_request(&sess, &turn_context).await
+                {
+                    *client_session = sess.services.model_client.new_session();
+                    let account = account_display_label(&sess, &account_id);
+                    info!(
+                        "switched active account after auth refresh failure; retrying sampling request: {account}"
+                    );
+                    initial_input = Some(prompt.input.clone());
+                    continue;
+                }
+                return Err(CodexErr::RefreshTokenFailed(e));
             }
             Err(err) => err,
         };
@@ -1015,6 +1073,77 @@ async fn run_sampling_request(
         )
         .await?;
     }
+}
+
+async fn maybe_switch_limited_account_for_next_request(
+    sess: &Session,
+    turn_context: &TurnContext,
+) -> Option<String> {
+    match sess
+        .services
+        .auth_manager
+        .switch_if_active_account_limited()
+        .await
+    {
+        Ok(Some(account_id)) => {
+            let account = account_display_label(sess, &account_id);
+            sess.send_event(
+                turn_context,
+                EventMsg::Warning(WarningEvent {
+                    message: format!(
+                        "Switched active ChatGPT account to {account} for the next request because the previous account is near or at its usage limit."
+                    ),
+                }),
+            )
+            .await;
+            Some(account_id)
+        }
+        Ok(None) => None,
+        Err(err) => {
+            warn!("failed to switch active account after rate-limit state changed: {err}");
+            None
+        }
+    }
+}
+
+async fn maybe_switch_auth_failed_account_for_next_request(
+    sess: &Session,
+    turn_context: &TurnContext,
+) -> Option<String> {
+    match sess
+        .services
+        .auth_manager
+        .switch_if_active_account_auth_failed()
+        .await
+    {
+        Ok(Some(account_id)) => {
+            let account = account_display_label(sess, &account_id);
+            sess.send_event(
+                turn_context,
+                EventMsg::Warning(WarningEvent {
+                    message: format!(
+                        "Switched active ChatGPT account to {account} and retrying because the previous account could not refresh its token."
+                    ),
+                }),
+            )
+            .await;
+            Some(account_id)
+        }
+        Ok(None) => None,
+        Err(err) => {
+            warn!("failed to switch active account after auth refresh failure: {err}");
+            None
+        }
+    }
+}
+
+fn account_display_label(sess: &Session, account_id: &str) -> String {
+    sess.services
+        .auth_manager
+        .account_display_label(account_id)
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| account_id.to_string())
 }
 
 #[expect(
@@ -1987,6 +2116,13 @@ async fn try_run_sampling_request(
             ResponseEvent::RateLimits(snapshot) => {
                 // Update internal state with latest rate limits, but defer sending until
                 // token usage is available to avoid duplicate TokenCount events.
+                if let Err(err) = sess
+                    .services
+                    .auth_manager
+                    .mark_active_account_limited(snapshot.clone())
+                {
+                    warn!("failed to record active account rate-limit state: {err}");
+                }
                 sess.record_rate_limits_info(snapshot).await;
                 should_emit_token_count = true;
             }

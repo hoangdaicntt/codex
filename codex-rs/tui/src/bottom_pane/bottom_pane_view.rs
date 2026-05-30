@@ -49,6 +49,11 @@ pub(crate) trait BottomPaneView: Renderable {
         None
     }
 
+    /// Whether the selected item can be acted on in list-based views.
+    fn selected_item_is_enabled(&self) -> Option<bool> {
+        None
+    }
+
     /// Active tab id for tabbed list-based views.
     #[allow(dead_code)]
     fn active_tab_id(&self) -> Option<&str> {

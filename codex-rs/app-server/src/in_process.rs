@@ -259,6 +259,7 @@ pub struct InProcessClientHandle {
     client: InProcessClientSender,
     event_rx: mpsc::Receiver<InProcessServerEvent>,
     runtime_handle: tokio::task::JoinHandle<()>,
+    auth_manager: Arc<AuthManager>,
     #[cfg(test)]
     _test_codex_home: Option<tempfile::TempDir>,
 }
@@ -340,6 +341,10 @@ impl InProcessClientHandle {
     pub fn sender(&self) -> InProcessClientSender {
         self.client.clone()
     }
+
+    pub fn auth_manager(&self) -> Arc<AuthManager> {
+        self.auth_manager.clone()
+    }
 }
 
 /// Starts an in-process app-server runtime and performs initialize handshake.
@@ -374,12 +379,12 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
     let installation_id = resolve_installation_id(&args.config.codex_home).await?;
     let (client_tx, mut client_rx) = mpsc::channel::<InProcessClientMessage>(channel_capacity);
     let (event_tx, event_rx) = mpsc::channel::<InProcessServerEvent>(channel_capacity);
+    let auth_manager =
+        AuthManager::shared_from_config(args.config.as_ref(), args.enable_codex_api_key_env).await;
+    let client_auth_manager = auth_manager.clone();
 
     let runtime_handle = tokio::spawn(async move {
         let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<OutgoingEnvelope>(channel_capacity);
-        let auth_manager =
-            AuthManager::shared_from_config(args.config.as_ref(), args.enable_codex_api_key_env)
-                .await;
         let analytics_events_client =
             analytics_events_client_from_config(Arc::clone(&auth_manager), args.config.as_ref());
         let outgoing_message_sender = Arc::new(OutgoingMessageSender::new(
@@ -719,6 +724,7 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
         client: InProcessClientSender { client_tx },
         event_rx,
         runtime_handle,
+        auth_manager: client_auth_manager,
         #[cfg(test)]
         _test_codex_home: None,
     })

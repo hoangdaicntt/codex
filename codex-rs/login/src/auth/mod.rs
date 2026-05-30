@@ -6,6 +6,7 @@ mod util;
 
 mod external_bearer;
 mod manager;
+pub mod multi_account;
 mod revoke;
 
 pub use error::RefreshTokenFailedError;
