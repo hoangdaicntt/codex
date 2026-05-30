@@ -83,3 +83,28 @@ jobs:
           name: ${{ matrix.artifact }}
           path: codex-rs/target/release/${{ matrix.binary }}
           if-no-files-found: error
+
+  build-linux:
+    name: Build linux
+    needs: test
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: codex-rs
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build binary
+        run: cargo build -p codex-cli
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: codex-linux
+          path: codex-rs/target/debug/codex
+          if-no-files-found: error

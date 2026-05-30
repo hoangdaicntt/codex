@@ -329,6 +329,80 @@ impl App {
                     self.chat_widget.add_error_message(err);
                 }
             },
+            AppEvent::AccountSwitchRequested { index } => {
+                let auth_manager = match app_server.auth_manager() {
+                    Some(auth_manager) => auth_manager,
+                    None => codex_login::AuthManager::shared_from_config(
+                        &self.config,
+                        /*enable_codex_api_key_env*/ false,
+                    )
+                    .await,
+                };
+                let result =
+                    crate::chatwidget::accounts::switch_account_for_picker(
+                        self.config.clone(),
+                        auth_manager,
+                        index,
+                    )
+                    .await;
+                self.app_event_tx
+                    .send(AppEvent::AccountSwitchFinished { result });
+            }
+            AppEvent::AccountsPickerLoadProgress { loaded, total } => {
+                self.chat_widget.update_accounts_picker_loading(loaded, total);
+            }
+            AppEvent::AccountsPickerLoaded { result } => match result {
+                Ok(index) if index.accounts.is_empty() => {
+                    if self.chat_widget.dismiss_accounts_picker() {
+                        self.chat_widget.add_info_message(
+                            "No saved ChatGPT accounts.".to_string(),
+                            /*hint*/ None,
+                        );
+                    }
+                }
+                Ok(index) => self.chat_widget.show_accounts_picker(index),
+                Err(err) => {
+                    if self.chat_widget.dismiss_accounts_picker() {
+                        self.chat_widget.add_error_message(err);
+                    }
+                }
+            },
+            AppEvent::AccountRemoveFinished { result } => match result {
+                Ok(result) => {
+                    self.chat_widget.update_account_state(
+                        result.status_account_display,
+                        result.plan_type,
+                        result.has_chatgpt_account,
+                    );
+                    self.chat_widget.add_info_message(result.message, /*hint*/ None);
+                    self.chat_widget.show_accounts_picker_with_selection(
+                        result.accounts_index,
+                        result.selected_idx,
+                    );
+                }
+                Err(err) => {
+                    self.chat_widget.add_error_message(err);
+                }
+            },
+            AppEvent::AccountRemoveRequested { account_id } => {
+                let auth_manager = match app_server.auth_manager() {
+                    Some(auth_manager) => auth_manager,
+                    None => codex_login::AuthManager::shared_from_config(
+                        &self.config,
+                        /*enable_codex_api_key_env*/ false,
+                    )
+                    .await,
+                };
+                let result =
+                    crate::chatwidget::accounts::remove_account_for_picker(
+                        self.config.clone(),
+                        auth_manager,
+                        account_id,
+                    )
+                    .await;
+                self.app_event_tx
+                    .send(AppEvent::AccountRemoveFinished { result });
+            }
             AppEvent::FatalExitRequest(message) => {
                 return Ok(AppRunControl::Exit(ExitReason::Fatal(message)));
             }

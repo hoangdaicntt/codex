@@ -16,6 +16,7 @@ use serde::Serialize;
 
 use crate::auth::AuthDotJson;
 use crate::auth::load_auth_dot_json;
+use crate::auth::logout;
 use crate::auth::save_auth;
 
 use super::metadata::AccountMetadata;
@@ -86,6 +87,8 @@ pub struct StoredAccount {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_limit_state: Option<StoredLimitState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_rate_limits: Option<StoredRateLimitSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_auth_failure: Option<StoredAuthFailureState>,
     pub auth: AuthDotJson,
 }
@@ -129,9 +132,23 @@ impl StoredLimitState {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StoredRateLimitSnapshot {
+    pub recorded_at: DateTime<Utc>,
+    pub snapshot: RateLimitSnapshot,
+}
+
 #[derive(Clone, Debug)]
 pub struct AccountsStore {
     codex_home: PathBuf,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RemoveAccountOutcome {
+    pub removed_account: StoredAccount,
+    pub new_active_account: Option<StoredAccount>,
+    pub active_account_changed: bool,
 }
 
 impl AccountsStore {
@@ -231,6 +248,77 @@ impl AccountsStore {
         Ok(changed)
     }
 
+    pub fn remove_account(
+        &self,
+        account_id: &AccountId,
+        auth_credentials_store_mode: AuthCredentialsStoreMode,
+    ) -> std::io::Result<RemoveAccountOutcome> {
+        let mut index = self.load()?;
+        let Some(removed_index) = index
+            .accounts
+            .iter()
+            .position(|account| &account.account_id == account_id)
+        else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("account {account_id} was not found"),
+            ));
+        };
+
+        let removed_account = index.accounts.remove(removed_index);
+        let removed_active = index.active_account_id.as_ref() == Some(account_id);
+        let new_active_account = if removed_active {
+            let next_index = if index.accounts.is_empty() {
+                None
+            } else {
+                Some(removed_index.min(index.accounts.len() - 1))
+            };
+            next_index.map(|next_index| index.accounts[next_index].clone())
+        } else {
+            index
+                .active_account_id
+                .as_ref()
+                .and_then(|active_account_id| {
+                    index
+                        .accounts
+                        .iter()
+                        .find(|account| &account.account_id == active_account_id)
+                })
+                .cloned()
+        };
+
+        if removed_active {
+            index.active_account_id = new_active_account
+                .as_ref()
+                .map(|account| account.account_id.clone());
+        }
+
+        self.save(&index)?;
+        if removed_active {
+            if let Some(active_account) = new_active_account.as_ref() {
+                save_active_auth_json(
+                    &self.codex_home,
+                    &active_account.auth,
+                    auth_credentials_store_mode,
+                )?;
+            } else {
+                logout(&self.codex_home, auth_credentials_store_mode)?;
+                if !matches!(
+                    auth_credentials_store_mode,
+                    AuthCredentialsStoreMode::File | AuthCredentialsStoreMode::Ephemeral
+                ) {
+                    logout(&self.codex_home, AuthCredentialsStoreMode::File)?;
+                }
+            }
+        }
+
+        Ok(RemoveAccountOutcome {
+            removed_account,
+            new_active_account,
+            active_account_changed: removed_active,
+        })
+    }
+
     pub fn sync_active_auth_json(
         &self,
         auth_credentials_store_mode: AuthCredentialsStoreMode,
@@ -248,6 +336,53 @@ impl AccountsStore {
         };
         save_active_auth_json(&self.codex_home, &account.auth, auth_credentials_store_mode)?;
         Ok(true)
+    }
+
+    pub fn update_account_auth(
+        &self,
+        account_id: &AccountId,
+        auth: AuthDotJson,
+        auth_credentials_store_mode: AuthCredentialsStoreMode,
+    ) -> std::io::Result<()> {
+        let mut index = self.load()?;
+        let active_account_id = index.active_account_id.clone();
+        let Some(account) = index
+            .accounts
+            .iter_mut()
+            .find(|account| &account.account_id == account_id)
+        else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("account {account_id} was not found"),
+            ));
+        };
+        account.auth = auth.clone();
+        account.last_auth_failure = None;
+        self.save(&index)?;
+        if active_account_id.as_ref() == Some(account_id) {
+            save_active_auth_json(&self.codex_home, &auth, auth_credentials_store_mode)?;
+        }
+        Ok(())
+    }
+
+    pub fn mark_account_rate_limits(
+        &self,
+        account_id: &AccountId,
+        snapshot: RateLimitSnapshot,
+    ) -> std::io::Result<()> {
+        let mut index = self.load()?;
+        let Some(account) = index
+            .accounts
+            .iter_mut()
+            .find(|account| &account.account_id == account_id)
+        else {
+            return Ok(());
+        };
+        account.last_rate_limits = Some(StoredRateLimitSnapshot {
+            recorded_at: Utc::now(),
+            snapshot,
+        });
+        self.save(&index)
     }
 
     pub fn active_limit_kind(
@@ -341,14 +476,23 @@ impl AccountsStore {
     }
 
     pub fn mark_active_refresh_failed(&self, message: Option<String>) -> std::io::Result<()> {
-        let mut index = self.load()?;
+        let index = self.load()?;
         let Some(active_account_id) = index.active_account_id.clone() else {
             return Ok(());
         };
+        self.mark_account_refresh_failed(&active_account_id, message)
+    }
+
+    pub fn mark_account_refresh_failed(
+        &self,
+        account_id: &AccountId,
+        message: Option<String>,
+    ) -> std::io::Result<()> {
+        let mut index = self.load()?;
         let Some(account) = index
             .accounts
             .iter_mut()
-            .find(|account| account.account_id == active_account_id)
+            .find(|account| &account.account_id == account_id)
         else {
             return Ok(());
         };
@@ -373,7 +517,6 @@ impl AccountsStore {
             &index,
             active_account_id,
             forced_workspace_ids,
-            Utc::now(),
         ))
     }
 }
@@ -411,6 +554,7 @@ fn upsert_auth(
             created_at: now,
             last_used_at: now,
             last_limit_state: None,
+            last_rate_limits: None,
             last_auth_failure: None,
             auth,
         });

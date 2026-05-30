@@ -958,6 +958,14 @@ async fn run_sampling_request(
     let mut initial_input = Some(input);
     loop {
         if let Some(account_id) =
+            maybe_switch_auth_failed_account_for_next_request(&sess, &turn_context).await
+        {
+            *client_session = sess.services.model_client.new_session();
+            info!(
+                "switched active account before sampling request after auth failure: {account_id}"
+            );
+        }
+        if let Some(account_id) =
             maybe_switch_limited_account_for_next_request(&sess, &turn_context).await
         {
             *client_session = sess.services.model_client.new_session();
@@ -1020,6 +1028,11 @@ async fn run_sampling_request(
                 let _ = maybe_switch_limited_account_for_next_request(&sess, &turn_context).await;
                 return Err(CodexErr::UsageLimitReached(e));
             }
+            Err(CodexErr::RefreshTokenFailed(e)) => {
+                let _ = maybe_switch_auth_failed_account_for_next_request(&sess, &turn_context)
+                    .await;
+                return Err(CodexErr::RefreshTokenFailed(e));
+            }
             Err(err) => err,
         };
 
@@ -1065,6 +1078,36 @@ async fn maybe_switch_limited_account_for_next_request(
         Ok(None) => None,
         Err(err) => {
             warn!("failed to switch active account after rate-limit state changed: {err}");
+            None
+        }
+    }
+}
+
+async fn maybe_switch_auth_failed_account_for_next_request(
+    sess: &Session,
+    turn_context: &TurnContext,
+) -> Option<String> {
+    match sess
+        .services
+        .auth_manager
+        .switch_if_active_account_auth_failed()
+        .await
+    {
+        Ok(Some(account_id)) => {
+            sess.send_event(
+                turn_context,
+                EventMsg::Warning(WarningEvent {
+                    message: format!(
+                        "Switched active ChatGPT account to {account_id} for the next request because the previous account could not refresh its token."
+                    ),
+                }),
+            )
+            .await;
+            Some(account_id)
+        }
+        Ok(None) => None,
+        Err(err) => {
+            warn!("failed to switch active account after auth refresh failure: {err}");
             None
         }
     }

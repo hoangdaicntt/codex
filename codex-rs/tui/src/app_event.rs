@@ -27,6 +27,7 @@ use codex_app_server_protocol::RateLimitSnapshot;
 use codex_app_server_protocol::SkillsListResponse;
 use codex_app_server_protocol::ThreadGoalStatus;
 use codex_file_search::FileMatch;
+use codex_login::auth::multi_account::AccountsIndex;
 use codex_protocol::ThreadId;
 use codex_protocol::openai_models::ModelPreset;
 use codex_utils_absolute_path::AbsolutePathBuf;
@@ -42,6 +43,7 @@ use crate::status::StatusAccountDisplay;
 use codex_app_server_protocol::AskForApproval;
 use codex_config::types::ApprovalsReviewer;
 use codex_features::Feature;
+use codex_login::auth::multi_account::AccountId;
 use codex_plugin::PluginCapabilitySummary;
 use codex_protocol::config_types::CollaborationModeMask;
 use codex_protocol::config_types::Personality;
@@ -113,6 +115,16 @@ pub(crate) struct ConnectorsSnapshot {
 #[derive(Debug)]
 pub(crate) struct AccountSwitchResult {
     pub(crate) message: String,
+    pub(crate) status_account_display: Option<StatusAccountDisplay>,
+    pub(crate) plan_type: Option<codex_protocol::account::PlanType>,
+    pub(crate) has_chatgpt_account: bool,
+}
+
+#[derive(Debug)]
+pub(crate) struct AccountRemoveResult {
+    pub(crate) message: String,
+    pub(crate) accounts_index: AccountsIndex,
+    pub(crate) selected_idx: Option<usize>,
     pub(crate) status_account_display: Option<StatusAccountDisplay>,
     pub(crate) plan_type: Option<codex_protocol::account::PlanType>,
     pub(crate) has_chatgpt_account: bool,
@@ -235,6 +247,32 @@ pub(crate) enum AppEvent {
     /// Result of a `/accounts` account switch request.
     AccountSwitchFinished {
         result: Result<AccountSwitchResult, String>,
+    },
+
+    /// Switch the active ChatGPT account from the `/accounts` picker.
+    AccountSwitchRequested {
+        index: usize,
+    },
+
+    /// Progress while refreshing saved accounts for the `/accounts` picker.
+    AccountsPickerLoadProgress {
+        loaded: usize,
+        total: usize,
+    },
+
+    /// Result of loading saved accounts for the `/accounts` picker.
+    AccountsPickerLoaded {
+        result: Result<AccountsIndex, String>,
+    },
+
+    /// Result of deleting an account from the `/accounts` picker.
+    AccountRemoveFinished {
+        result: Result<AccountRemoveResult, String>,
+    },
+
+    /// Delete the selected ChatGPT account from the `/accounts` picker.
+    AccountRemoveRequested {
+        account_id: AccountId,
     },
 
     /// Request to exit the application due to a fatal error.

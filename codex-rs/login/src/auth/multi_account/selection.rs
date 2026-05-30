@@ -16,6 +16,7 @@ const NEAR_LIMIT_USED_PERCENT: f64 = 90.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SelectionReason {
+    AuthFailure,
     ProactiveNearLimit,
     UsageLimitReached,
     Manual,
@@ -76,7 +77,6 @@ pub(crate) fn select_next_available_account(
     index: &AccountsIndex,
     active_account_id: &AccountId,
     forced_workspace_ids: Option<&[String]>,
-    now: DateTime<Utc>,
 ) -> Option<AccountId> {
     let active_index = index
         .accounts
@@ -88,14 +88,13 @@ pub(crate) fn select_next_available_account(
         .cycle()
         .skip(active_index + 1)
         .take(index.accounts.len().saturating_sub(1))
-        .find(|account| account_is_eligible(account, forced_workspace_ids, now))
+        .find(|account| account_is_eligible(account, forced_workspace_ids))
         .map(|account| account.account_id.clone())
 }
 
 fn account_is_eligible(
     account: &StoredAccount,
     forced_workspace_ids: Option<&[String]>,
-    now: DateTime<Utc>,
 ) -> bool {
     if let Some(expected) = forced_workspace_ids
         && !account
@@ -111,14 +110,6 @@ fn account_is_eligible(
     }
 
     if account.last_auth_failure.is_some() {
-        return false;
-    }
-
-    if account
-        .last_limit_state
-        .as_ref()
-        .is_some_and(|state| state.is_active(now))
-    {
         return false;
     }
 

@@ -1,5 +1,4 @@
 use base64::Engine;
-use chrono::Duration;
 use chrono::TimeZone;
 use chrono::Utc;
 use codex_app_server_protocol::AuthMode;
@@ -14,6 +13,7 @@ use pretty_assertions::assert_eq;
 use tempfile::tempdir;
 
 use crate::auth::AuthDotJson;
+use crate::auth::AuthManager;
 use crate::auth::load_auth_dot_json;
 use crate::auth::multi_account::AccountId;
 use crate::auth::multi_account::AccountsIndex;
@@ -22,6 +22,7 @@ use crate::auth::multi_account::LimitClassification;
 use crate::auth::multi_account::SelectionReason;
 use crate::auth::multi_account::StoredLimitKind;
 use crate::auth::multi_account::StoredLimitState;
+use crate::auth::multi_account::StoredRateLimitSnapshot;
 use crate::auth::multi_account::account_id_at_index;
 use crate::auth::multi_account::classify_rate_limit_snapshot;
 use crate::auth::multi_account::display_rows;
@@ -146,7 +147,98 @@ fn switch_active_account_rewrites_auth_json() -> anyhow::Result<()> {
 }
 
 #[test]
-fn selection_skips_exhausted_accounts_until_reset() -> anyhow::Result<()> {
+fn remove_non_active_account_preserves_active_auth() -> anyhow::Result<()> {
+    let codex_home = tempdir()?;
+    let store = AccountsStore::new(codex_home.path().to_path_buf());
+    store.upsert_active_auth(chatgpt_auth("account-a", "a@example.com"))?;
+    store.upsert_active_auth(chatgpt_auth("account-b", "b@example.com"))?;
+    store.switch_active_account(
+        &AccountId::from("account-a"),
+        AuthCredentialsStoreMode::File,
+    )?;
+
+    let outcome = store.remove_account(
+        &AccountId::from("account-b"),
+        AuthCredentialsStoreMode::File,
+    )?;
+
+    let index = store.load()?;
+    assert_eq!(index.accounts.len(), 1);
+    assert_eq!(index.active_account_id, Some(AccountId::from("account-a")));
+    assert_eq!(outcome.removed_account.account_id, AccountId::from("account-b"));
+    assert!(!outcome.active_account_changed);
+    let auth = load_auth_dot_json(codex_home.path(), AuthCredentialsStoreMode::File)?
+        .expect("active auth should exist");
+    assert_eq!(
+        auth.tokens.and_then(|tokens| tokens.account_id),
+        Some("account-a".to_string())
+    );
+    Ok(())
+}
+
+#[test]
+fn remove_active_account_selects_next_account() -> anyhow::Result<()> {
+    let codex_home = tempdir()?;
+    let store = AccountsStore::new(codex_home.path().to_path_buf());
+    store.upsert_active_auth(chatgpt_auth("account-a", "a@example.com"))?;
+    store.upsert_active_auth(chatgpt_auth("account-b", "b@example.com"))?;
+
+    let outcome = store.remove_account(
+        &AccountId::from("account-b"),
+        AuthCredentialsStoreMode::File,
+    )?;
+
+    let index = store.load()?;
+    assert_eq!(index.accounts.len(), 1);
+    assert_eq!(index.active_account_id, Some(AccountId::from("account-a")));
+    assert_eq!(
+        outcome
+            .new_active_account
+            .as_ref()
+            .map(|account| account.account_id.clone()),
+        Some(AccountId::from("account-a"))
+    );
+    assert!(outcome.active_account_changed);
+    let auth = load_auth_dot_json(codex_home.path(), AuthCredentialsStoreMode::File)?
+        .expect("active auth should exist");
+    assert_eq!(
+        auth.tokens.and_then(|tokens| tokens.account_id),
+        Some("account-a".to_string())
+    );
+    Ok(())
+}
+
+#[test]
+fn remove_last_account_clears_active_auth() -> anyhow::Result<()> {
+    let codex_home = tempdir()?;
+    let store = AccountsStore::new(codex_home.path().to_path_buf());
+    store.upsert_active_auth(chatgpt_auth("account-a", "a@example.com"))?;
+
+    let outcome = store.remove_account(
+        &AccountId::from("account-a"),
+        AuthCredentialsStoreMode::File,
+    )?;
+
+    let index = store.load()?;
+    assert_eq!(
+        index,
+        AccountsIndex {
+            version: 1,
+            active_account_id: None,
+            accounts: Vec::new(),
+        }
+    );
+    assert_eq!(outcome.new_active_account, None);
+    assert!(outcome.active_account_changed);
+    assert_eq!(
+        load_auth_dot_json(codex_home.path(), AuthCredentialsStoreMode::File)?,
+        None
+    );
+    Ok(())
+}
+
+#[test]
+fn selection_uses_next_picker_account_even_when_exhausted() -> anyhow::Result<()> {
     let codex_home = tempdir()?;
     let store = AccountsStore::new(codex_home.path().to_path_buf());
     store.upsert_active_auth(chatgpt_auth("account-a", "a@example.com"))?;
@@ -168,12 +260,12 @@ fn selection_skips_exhausted_accounts_until_reset() -> anyhow::Result<()> {
 
     let next = store.next_available_account(SelectionReason::ProactiveNearLimit, None)?;
 
-    assert_eq!(next, Some(AccountId::from("account-c")));
+    assert_eq!(next, Some(AccountId::from("account-b")));
     Ok(())
 }
 
 #[test]
-fn selection_skips_near_limit_accounts_until_reset() -> anyhow::Result<()> {
+fn selection_uses_next_picker_account_even_when_near_limit() -> anyhow::Result<()> {
     let codex_home = tempdir()?;
     let store = AccountsStore::new(codex_home.path().to_path_buf());
     store.upsert_active_auth(chatgpt_auth("account-a", "a@example.com"))?;
@@ -191,29 +283,25 @@ fn selection_skips_near_limit_accounts_until_reset() -> anyhow::Result<()> {
 
     let next = store.next_available_account(SelectionReason::ProactiveNearLimit, None)?;
 
-    assert_eq!(next, Some(AccountId::from("account-c")));
+    assert_eq!(next, Some(AccountId::from("account-b")));
     Ok(())
 }
 
 #[test]
-fn selection_allows_accounts_after_limit_reset_expires() -> anyhow::Result<()> {
+fn selection_wraps_from_last_account_to_first() -> anyhow::Result<()> {
     let codex_home = tempdir()?;
     let store = AccountsStore::new(codex_home.path().to_path_buf());
     store.upsert_active_auth(chatgpt_auth("account-a", "a@example.com"))?;
     store.upsert_active_auth(chatgpt_auth("account-b", "b@example.com"))?;
+    store.upsert_active_auth(chatgpt_auth("account-c", "c@example.com"))?;
     store.switch_active_account(
-        &AccountId::from("account-b"),
-        AuthCredentialsStoreMode::File,
-    )?;
-    store.mark_active_exhausted(Some(Utc::now() - Duration::minutes(1)))?;
-    store.switch_active_account(
-        &AccountId::from("account-a"),
+        &AccountId::from("account-c"),
         AuthCredentialsStoreMode::File,
     )?;
 
     let next = store.next_available_account(SelectionReason::UsageLimitReached, None)?;
 
-    assert_eq!(next, Some(AccountId::from("account-b")));
+    assert_eq!(next, Some(AccountId::from("account-a")));
     Ok(())
 }
 
@@ -253,6 +341,19 @@ fn display_rows_use_compact_account_format() -> anyhow::Result<()> {
         resets_at: None,
         snapshot: Some(snapshot(Some(12.0), Some(44.0), None, None)),
     });
+    index.accounts[0].last_rate_limits = Some(StoredRateLimitSnapshot {
+        recorded_at: Utc.with_ymd_and_hms(2026, 5, 28, 8, 0, 0).unwrap(),
+        snapshot: snapshot_with_resets(
+            Some((12.0, Utc.with_ymd_and_hms(2026, 5, 28, 11, 12, 0).unwrap())),
+            Some((44.0, Utc.with_ymd_and_hms(2026, 5, 31, 10, 0, 0).unwrap())),
+        ),
+    });
+    index.accounts[0]
+        .auth
+        .tokens
+        .as_mut()
+        .expect("tokens")
+        .access_token = jwt_with_exp(Utc.with_ymd_and_hms(2026, 5, 28, 10, 43, 0).unwrap());
     store.save(&index)?;
     let now = Utc.with_ymd_and_hms(2026, 5, 28, 10, 0, 0).unwrap();
 
@@ -260,10 +361,11 @@ fn display_rows_use_compact_account_format() -> anyhow::Result<()> {
 
     assert_eq!(rows.len(), 1);
     assert!(rows[0].is_active);
-    assert!(rows[0].line.starts_with("* 1. a@example.com "));
-    assert!(rows[0].line.contains("(5H 12%, Week 44%)"));
-    assert!(rows[0].line.contains("- 2 hours ago | "));
-    assert!(rows[0].line.ends_with("28/05/2026"));
+    assert!(rows[0].line.starts_with("* 1. a@example.com\n   "));
+    assert!(rows[0].line.contains("5h 88%/1h12m"));
+    assert!(rows[0].line.contains("Week 56%/3d"));
+    assert!(rows[0].line.contains("used 2h"));
+    assert!(rows[0].line.contains("token exp 43m"));
     Ok(())
 }
 
@@ -287,6 +389,42 @@ fn selection_skips_refresh_failed_accounts() -> anyhow::Result<()> {
     let next = store.next_available_account(SelectionReason::ProactiveNearLimit, None)?;
 
     assert_eq!(next, Some(AccountId::from("account-c")));
+    Ok(())
+}
+
+#[tokio::test]
+async fn switch_if_active_account_auth_failed_switches_to_next_account() -> anyhow::Result<()> {
+    let codex_home = tempdir()?;
+    let store = AccountsStore::new(codex_home.path().to_path_buf());
+    store.upsert_active_auth(chatgpt_auth("account-a", "a@example.com"))?;
+    store.upsert_active_auth(chatgpt_auth("account-b", "b@example.com"))?;
+    store.upsert_active_auth(chatgpt_auth("account-c", "c@example.com"))?;
+    store.switch_active_account(
+        &AccountId::from("account-b"),
+        AuthCredentialsStoreMode::File,
+    )?;
+    store.mark_active_refresh_failed(Some("refresh token already used".to_string()))?;
+    let manager = AuthManager::shared(
+        codex_home.path().to_path_buf(),
+        /*enable_codex_api_key_env*/ false,
+        AuthCredentialsStoreMode::File,
+        /*chatgpt_base_url*/ None,
+    )
+    .await;
+
+    let switched_account_id = manager.switch_if_active_account_auth_failed().await?;
+
+    assert_eq!(switched_account_id, Some("account-c".to_string()));
+    assert_eq!(
+        store.load()?.active_account_id,
+        Some(AccountId::from("account-c"))
+    );
+    let auth = load_auth_dot_json(codex_home.path(), AuthCredentialsStoreMode::File)?
+        .expect("active auth should be synced");
+    assert_eq!(
+        auth.tokens.and_then(|tokens| tokens.account_id),
+        Some("account-c".to_string())
+    );
     Ok(())
 }
 
@@ -415,7 +553,8 @@ fn mark_active_exhausted_from_snapshot_preserves_display_percentages() -> anyhow
         index.active_account_id.as_ref(),
         Utc::now(),
     );
-    assert!(rows[0].line.contains("(5H 12%, Week 44%)"));
+    assert!(rows[0].line.contains("5h 88%/-"));
+    assert!(rows[0].line.contains("Week 56%/-"));
     Ok(())
 }
 
@@ -460,6 +599,19 @@ fn jwt_for_account(account_id: &str, email: &str) -> String {
     format!("{header_b64}.{payload_b64}.sig")
 }
 
+fn jwt_with_exp(expires_at: chrono::DateTime<Utc>) -> String {
+    let encode = |bytes: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+    let header_b64 = encode(br#"{"alg":"none","typ":"JWT"}"#);
+    let payload_b64 = encode(
+        serde_json::to_string(&serde_json::json!({
+            "exp": expires_at.timestamp(),
+        }))
+        .expect("test payload should serialize")
+        .as_bytes(),
+    );
+    format!("{header_b64}.{payload_b64}.sig")
+}
+
 fn snapshot(
     primary_used_percent: Option<f64>,
     secondary_used_percent: Option<f64>,
@@ -474,6 +626,29 @@ fn snapshot(
         credits,
         plan_type: None,
         rate_limit_reached_type,
+    }
+}
+
+fn snapshot_with_resets(
+    primary: Option<(f64, chrono::DateTime<Utc>)>,
+    secondary: Option<(f64, chrono::DateTime<Utc>)>,
+) -> RateLimitSnapshot {
+    RateLimitSnapshot {
+        limit_id: Some("codex".to_string()),
+        limit_name: None,
+        primary: primary.map(|(used_percent, resets_at)| RateLimitWindow {
+            used_percent,
+            window_minutes: None,
+            resets_at: Some(resets_at.timestamp()),
+        }),
+        secondary: secondary.map(|(used_percent, resets_at)| RateLimitWindow {
+            used_percent,
+            window_minutes: None,
+            resets_at: Some(resets_at.timestamp()),
+        }),
+        credits: None,
+        plan_type: None,
+        rate_limit_reached_type: None,
     }
 }
 

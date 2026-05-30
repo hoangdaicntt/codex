@@ -1513,6 +1513,24 @@ impl AuthManager {
         self.switch_to_next_available_account(reason).await
     }
 
+    pub async fn switch_if_active_account_auth_failed(&self) -> std::io::Result<Option<String>> {
+        let store = AccountsStore::new(self.codex_home.clone());
+        let index = store.load()?;
+        let Some(active_account_id) = index.active_account_id.as_ref() else {
+            return Ok(None);
+        };
+        let active_account_has_auth_failure = index
+            .accounts
+            .iter()
+            .find(|account| &account.account_id == active_account_id)
+            .is_some_and(|account| account.last_auth_failure.is_some());
+        if !active_account_has_auth_failure {
+            return Ok(None);
+        }
+        self.switch_to_next_available_account(SelectionReason::AuthFailure)
+            .await
+    }
+
     /// Subscribes to cached auth changes that can affect request recovery.
     pub fn auth_change_receiver(&self) -> watch::Receiver<u64> {
         self.auth_change_tx.subscribe()
