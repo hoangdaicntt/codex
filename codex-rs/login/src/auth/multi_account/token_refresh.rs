@@ -9,6 +9,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
 use std::future::Future;
+use tokio::task::JoinSet;
 
 use crate::auth::AuthDotJson;
 use crate::auth::CLIENT_ID;
@@ -43,44 +44,59 @@ impl AccountsStore {
     pub async fn refresh_account_limits_for_display<F, Fut, P>(
         &self,
         auth_credentials_store_mode: AuthCredentialsStoreMode,
-        mut fetch_rate_limits: F,
+        fetch_rate_limits: F,
         mut progress: P,
     ) where
-        F: FnMut(ResolvedStoredAccountAuth) -> Fut,
-        Fut: Future<Output = Option<RateLimitSnapshot>>,
+        F: Fn(ResolvedStoredAccountAuth) -> Fut + Clone + Send + 'static,
+        Fut: Future<Output = Option<RateLimitSnapshot>> + Send + 'static,
         P: FnMut(usize, usize),
     {
         let Ok(index) = self.load() else {
             return;
         };
         let total = index.accounts.len();
+        let mut loaded = 0;
+        let mut fetches = JoinSet::new();
         progress(0, total);
-        for (offset, account) in index.accounts.into_iter().enumerate() {
+        for account in index.accounts {
             let auth = match self
                 .resolve_account_auth_for_usage(&account.account_id, auth_credentials_store_mode)
                 .await
             {
                 Ok(Some(auth)) => auth,
                 Ok(None) => {
-                    progress(offset + 1, total);
+                    loaded += 1;
+                    progress(loaded, total);
                     continue;
                 }
                 Err(RefreshTokenError::Permanent(err)) => {
                     let _ = self
                         .mark_account_refresh_failed(&account.account_id, Some(err.to_string()));
-                    progress(offset + 1, total);
+                    loaded += 1;
+                    progress(loaded, total);
                     continue;
                 }
                 Err(RefreshTokenError::Transient(_)) => {
-                    progress(offset + 1, total);
+                    loaded += 1;
+                    progress(loaded, total);
                     continue;
                 }
             };
 
-            if let Some(snapshot) = fetch_rate_limits(auth).await {
-                let _ = self.mark_account_rate_limits(&account.account_id, snapshot);
+            let account_id = account.account_id;
+            let fetch_rate_limits = fetch_rate_limits.clone();
+            fetches.spawn(async move {
+                let snapshot = fetch_rate_limits(auth).await;
+                (account_id, snapshot)
+            });
+        }
+
+        while let Some(result) = fetches.join_next().await {
+            if let Ok((account_id, Some(snapshot))) = result {
+                let _ = self.mark_account_rate_limits(&account_id, snapshot);
             }
-            progress(offset + 1, total);
+            loaded += 1;
+            progress(loaded, total);
         }
     }
 
