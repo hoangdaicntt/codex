@@ -163,11 +163,12 @@ async fn refresh_account_limits_for_display(
     store: &AccountsStore,
     tx: Option<&crate::app_event_sender::AppEventSender>,
 ) {
+    let chatgpt_base_url = config.chatgpt_base_url.clone();
     store
         .refresh_account_limits_for_display(
             config.cli_auth_credentials_store_mode,
-            |auth| {
-                let chatgpt_base_url = config.chatgpt_base_url.clone();
+            move |auth| {
+                let chatgpt_base_url = chatgpt_base_url.clone();
                 async move {
                     let Ok(client) = BackendClient::new(chatgpt_base_url) else {
                         return None;

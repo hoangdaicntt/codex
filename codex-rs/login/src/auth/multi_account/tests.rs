@@ -10,6 +10,9 @@ use codex_protocol::protocol::RateLimitReachedType;
 use codex_protocol::protocol::RateLimitSnapshot;
 use codex_protocol::protocol::RateLimitWindow;
 use pretty_assertions::assert_eq;
+use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use tempfile::tempdir;
 
 use crate::auth::AuthDotJson;
@@ -501,6 +504,54 @@ fn selection_skips_refresh_failed_accounts() -> anyhow::Result<()> {
     let next = store.next_available_account(SelectionReason::ProactiveNearLimit, None)?;
 
     assert_eq!(next, Some(AccountId::from("account-c")));
+    Ok(())
+}
+
+#[tokio::test]
+async fn refresh_account_limits_for_display_fetches_accounts_concurrently() -> anyhow::Result<()> {
+    let codex_home = tempdir()?;
+    let store = AccountsStore::new(codex_home.path().to_path_buf());
+    store.upsert_active_auth(chatgpt_auth("account-a", "a@example.com"))?;
+    store.upsert_active_auth(chatgpt_auth("account-b", "b@example.com"))?;
+    store.upsert_active_auth(chatgpt_auth("account-c", "c@example.com"))?;
+    let in_flight = Arc::new(AtomicUsize::new(0));
+    let max_in_flight = Arc::new(AtomicUsize::new(0));
+    let mut progress = Vec::new();
+
+    store
+        .refresh_account_limits_for_display(
+            AuthCredentialsStoreMode::File,
+            {
+                let in_flight = in_flight.clone();
+                let max_in_flight = max_in_flight.clone();
+                move |_auth| {
+                    let in_flight = in_flight.clone();
+                    let max_in_flight = max_in_flight.clone();
+                    async move {
+                        let current = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                        max_in_flight.fetch_max(current, Ordering::SeqCst);
+                        tokio::task::yield_now().await;
+                        in_flight.fetch_sub(1, Ordering::SeqCst);
+                        Some(snapshot(Some(25.0), None, None, None))
+                    }
+                }
+            },
+            |loaded, total| progress.push((loaded, total)),
+        )
+        .await;
+
+    assert!(max_in_flight.load(Ordering::SeqCst) > 1);
+    assert_eq!(progress.first(), Some(&(0, 3)));
+    assert_eq!(progress.last(), Some(&(3, 3)));
+    let index = store.load()?;
+    assert_eq!(
+        index
+            .accounts
+            .iter()
+            .filter(|account| account.last_rate_limits.is_some())
+            .count(),
+        3
+    );
     Ok(())
 }
 

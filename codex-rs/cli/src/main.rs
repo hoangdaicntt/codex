@@ -1676,7 +1676,8 @@ async fn run_accounts_command(cmd: AccountsCommand) -> anyhow::Result<()> {
         AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false).await;
     let store = AccountsStore::new(config.codex_home.to_path_buf());
     store.import_active_auth_if_missing(config.cli_auth_credentials_store_mode)?;
-    refresh_account_limits_for_display(&config, &store).await;
+    let show_loading = std::io::stdout().is_terminal() && std::io::stderr().is_terminal();
+    refresh_account_limits_for_display(&config, &store, show_loading).await;
 
     let accounts_index = store.load()?;
     let rows = display_rows(
@@ -1758,12 +1759,14 @@ async fn run_accounts_command(cmd: AccountsCommand) -> anyhow::Result<()> {
 async fn refresh_account_limits_for_display(
     config: &codex_core::config::Config,
     store: &AccountsStore,
+    show_loading: bool,
 ) {
+    let chatgpt_base_url = config.chatgpt_base_url.clone();
     store
         .refresh_account_limits_for_display(
             config.cli_auth_credentials_store_mode,
-            |auth| {
-                let chatgpt_base_url = config.chatgpt_base_url.clone();
+            move |auth| {
+                let chatgpt_base_url = chatgpt_base_url.clone();
                 async move {
                     let Ok(client) = BackendClient::new(chatgpt_base_url) else {
                         return None;
@@ -1780,9 +1783,26 @@ async fn refresh_account_limits_for_display(
                         .and_then(preferred_account_limit_snapshot)
                 }
             },
-            |_, _| {},
+            |loaded, total| {
+                if show_loading {
+                    print_accounts_loading_progress(loaded, total);
+                }
+            },
         )
         .await;
+    if show_loading {
+        eprintln!();
+    }
+}
+
+fn print_accounts_loading_progress(loaded: usize, total: usize) {
+    let label = if total == 0 {
+        "Loading saved accounts...".to_string()
+    } else {
+        format!("Loading saved accounts {loaded}/{total}...")
+    };
+    eprint!("\r{label}");
+    let _ = std::io::stderr().flush();
 }
 
 async fn load_cli_config(
