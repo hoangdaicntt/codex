@@ -230,6 +230,9 @@ pub(crate) enum AppEvent {
     /// Resume a thread by UUID or thread name inside the running TUI session.
     ResumeSessionByIdOrName(String),
 
+    /// Reload the current thread inside the running TUI session.
+    ReloadCurrentSession,
+
     /// Fork the current session into a new thread.
     ForkCurrentSession,
 

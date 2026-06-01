@@ -31,6 +31,7 @@ pub enum SlashCommand {
     Rename,
     New,
     Resume,
+    Reload,
     Fork,
     Init,
     Compact,
@@ -87,6 +88,7 @@ impl SlashCommand {
             SlashCommand::Review => "review my current changes and find issues",
             SlashCommand::Rename => "rename the current thread",
             SlashCommand::Resume => "resume a saved chat",
+            SlashCommand::Reload => "reload the current chat",
             SlashCommand::Clear => "clear the terminal and start a new chat",
             SlashCommand::Fork => "fork the current chat",
             SlashCommand::Quit | SlashCommand::Exit => "exit Codex",
@@ -214,6 +216,7 @@ impl SlashCommand {
             | SlashCommand::DebugConfig
             | SlashCommand::Ps
             | SlashCommand::Stop
+            | SlashCommand::Reload
             | SlashCommand::Goal
             | SlashCommand::Mcp
             | SlashCommand::Apps
@@ -285,6 +288,7 @@ mod tests {
         );
         assert!(SlashCommand::Accounts.available_during_task());
         assert!(SlashCommand::Accounts.available_in_side_conversation());
+        assert!(SlashCommand::Reload.available_during_task());
         assert!(SlashCommand::Goal.available_during_task());
         assert!(SlashCommand::Ide.available_during_task());
         assert!(SlashCommand::Title.available_during_task());

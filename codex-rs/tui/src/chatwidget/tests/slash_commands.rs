@@ -1847,6 +1847,15 @@ async fn slash_resume_opens_picker() {
 }
 
 #[tokio::test]
+async fn slash_reload_requests_current_session_reload() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+
+    chat.dispatch_command(SlashCommand::Reload);
+
+    assert_matches!(rx.try_recv(), Ok(AppEvent::ReloadCurrentSession));
+}
+
+#[tokio::test]
 async fn slash_resume_with_arg_requests_named_session() {
     let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 

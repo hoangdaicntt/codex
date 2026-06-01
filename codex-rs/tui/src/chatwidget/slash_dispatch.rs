@@ -170,6 +170,9 @@ impl ChatWidget {
             SlashCommand::Resume => {
                 self.app_event_tx.send(AppEvent::OpenResumePicker);
             }
+            SlashCommand::Reload => {
+                self.app_event_tx.send(AppEvent::ReloadCurrentSession);
+            }
             SlashCommand::Fork => {
                 self.app_event_tx.send(AppEvent::ForkCurrentSession);
             }
@@ -954,6 +957,7 @@ impl ChatWidget {
             | SlashCommand::New
             | SlashCommand::Clear
             | SlashCommand::Resume
+            | SlashCommand::Reload
             | SlashCommand::Fork
             | SlashCommand::Init
             | SlashCommand::Compact

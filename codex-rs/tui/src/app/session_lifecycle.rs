@@ -769,6 +769,62 @@ impl App {
 
         Ok(AppRunControl::Continue)
     }
+
+    pub(super) async fn reload_current_session(
+        &mut self,
+        tui: &mut tui::Tui,
+        app_server: &mut AppServerSession,
+    ) -> Result<AppRunControl> {
+        let Some(thread_id) = self.chat_widget.thread_id() else {
+            self.chat_widget
+                .add_error_message("No active session is available to reload.".to_string());
+            tui.frame_requester().schedule_frame();
+            return Ok(AppRunControl::Continue);
+        };
+
+        self.refresh_in_memory_config_from_disk_best_effort("reloading the thread")
+            .await;
+        let mut reload_config = self.config.clone();
+        self.apply_runtime_policy_overrides(&mut reload_config);
+
+        match app_server
+            .resume_thread(reload_config.clone(), thread_id)
+            .await
+        {
+            Ok(reloaded) => {
+                self.config = reload_config;
+                tui.set_notification_settings(
+                    self.config.tui_notifications.method,
+                    self.config.tui_notifications.condition,
+                );
+                self.file_search
+                    .update_search_dir(self.config.cwd.to_path_buf());
+                match self
+                    .replace_chat_widget_with_app_server_thread(
+                        tui, app_server, reloaded, /*initial_user_message*/ None,
+                    )
+                    .await
+                {
+                    Ok(()) => {
+                        self.chat_widget
+                            .add_info_message("Session reloaded.".to_string(), /*hint*/ None);
+                    }
+                    Err(err) => {
+                        self.chat_widget.add_error_message(format!(
+                            "Failed to attach to reloaded session: {err}"
+                        ));
+                    }
+                }
+            }
+            Err(err) => {
+                self.chat_widget
+                    .add_error_message(format!("Failed to reload session: {err}"));
+            }
+        }
+
+        tui.frame_requester().schedule_frame();
+        Ok(AppRunControl::Continue)
+    }
 }
 
 #[cfg(test)]

@@ -121,6 +121,9 @@ impl App {
                     }
                 }
             }
+            AppEvent::ReloadCurrentSession => {
+                return self.reload_current_session(tui, app_server).await;
+            }
             AppEvent::ForkCurrentSession => {
                 self.session_telemetry.counter(
                     "codex.thread.fork",
