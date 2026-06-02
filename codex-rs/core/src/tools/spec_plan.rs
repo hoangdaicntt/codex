@@ -60,6 +60,7 @@ use codex_mcp::ToolInfo;
 use codex_protocol::dynamic_tools::DynamicToolSpec;
 use codex_protocol::openai_models::ConfigShellToolType;
 use codex_protocol::openai_models::InputModality;
+use codex_protocol::openai_models::ToolMode;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_tools::DiscoverableTool;
@@ -71,7 +72,9 @@ use codex_tools::ToolEnvironmentMode;
 use codex_tools::ToolExecutor;
 use codex_tools::ToolName;
 use codex_tools::ToolOutput;
+use codex_tools::ToolSearchInfo;
 use codex_tools::ToolSpec;
+use codex_tools::UnifiedExecShellMode;
 use codex_tools::can_request_original_image_detail;
 use codex_tools::collect_code_mode_exec_prompt_tool_definitions;
 use codex_tools::collect_request_plugin_install_entries;
@@ -230,8 +233,10 @@ fn spec_for_model_request(
     exposure: ToolExposure,
     spec: ToolSpec,
 ) -> ToolSpec {
-    if code_mode_enabled(turn_context)
-        && exposure != ToolExposure::DirectModelOnly
+    if matches!(
+        turn_context.tool_mode,
+        ToolMode::CodeMode | ToolMode::CodeModeOnly
+    ) && exposure != ToolExposure::DirectModelOnly
         && codex_code_mode::is_code_mode_nested_tool(spec.name())
     {
         codex_tools::augment_tool_spec_for_code_mode(spec)
@@ -280,14 +285,6 @@ pub(crate) fn tool_suggest_enabled(turn_context: &TurnContext) -> bool {
 
 fn namespace_tools_enabled(turn_context: &TurnContext) -> bool {
     turn_context.provider.capabilities().namespace_tools
-}
-
-fn code_mode_enabled(turn_context: &TurnContext) -> bool {
-    turn_context.features.get().enabled(Feature::CodeMode)
-}
-
-fn code_mode_only_enabled(turn_context: &TurnContext) -> bool {
-    code_mode_enabled(turn_context) && turn_context.features.get().enabled(Feature::CodeModeOnly)
 }
 
 fn multi_agent_v2_enabled(turn_context: &TurnContext) -> bool {
@@ -398,7 +395,7 @@ fn is_hidden_by_code_mode_only(
     tool_name: &ToolName,
     exposure: ToolExposure,
 ) -> bool {
-    code_mode_only_enabled(turn_context)
+    turn_context.tool_mode == ToolMode::CodeModeOnly
         && exposure != ToolExposure::DirectModelOnly
         && codex_code_mode::is_code_mode_nested_tool(&codex_tools::code_mode_name_for_tool_name(
             tool_name,
@@ -410,7 +407,10 @@ fn build_code_mode_executors(
     executors: &[Arc<dyn CoreToolRuntime>],
     deferred_tools_available: bool,
 ) -> Vec<Arc<dyn CoreToolRuntime>> {
-    if !code_mode_enabled(turn_context) {
+    if !matches!(
+        turn_context.tool_mode,
+        ToolMode::CodeMode | ToolMode::CodeModeOnly
+    ) {
         return vec![];
     }
 
@@ -444,7 +444,7 @@ fn build_code_mode_executors(
             create_code_mode_tool(
                 &enabled_tools,
                 &namespace_descriptions,
-                code_mode_only_enabled(turn_context),
+                turn_context.tool_mode == ToolMode::CodeModeOnly,
                 deferred_tools_available,
             ),
             code_mode_nested_tool_specs,
@@ -566,6 +566,7 @@ fn add_shell_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut Planne
                 allow_login_shell,
                 exec_permission_approvals_enabled,
                 include_environment_id,
+                include_shell_parameter: unified_exec_should_include_shell_parameter(turn_context),
             }));
             planned_tools.add(WriteStdinHandler);
 
@@ -580,6 +581,17 @@ fn add_shell_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut Planne
             planned_tools.add(ShellCommandHandler::new(shell_command_options));
         }
     }
+}
+
+fn unified_exec_should_include_shell_parameter(turn_context: &TurnContext) -> bool {
+    !matches!(
+        &turn_context.unified_exec_shell_mode,
+        UnifiedExecShellMode::ZshFork(_)
+    ) || turn_context
+        .environments
+        .turn_environments
+        .iter()
+        .any(|environment| environment.environment.is_remote())
 }
 
 fn add_mcp_resource_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut PlannedTools) {
@@ -602,9 +614,11 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut
         planned_tools.add(UpdateGoalHandler);
     }
 
-    planned_tools.add(RequestUserInputHandler {
-        available_modes: request_user_input_available_modes(features),
-    });
+    if turn_context.config.experimental_request_user_input_enabled {
+        planned_tools.add(RequestUserInputHandler {
+            available_modes: request_user_input_available_modes(features),
+        });
+    }
 
     if features.enabled(Feature::RequestPermissionsTool) {
         planned_tools.add(RequestPermissionsHandler);
@@ -617,7 +631,9 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut
         planned_tools.add(ListAvailablePluginsToInstallHandler::new(
             collect_request_plugin_install_entries(discoverable_tools),
         ));
-        planned_tools.add(RequestPluginInstallHandler);
+        planned_tools.add(RequestPluginInstallHandler::new(
+            discoverable_tools.to_vec(),
+        ));
     }
 
     if environment_mode.has_environment() && turn_context.model_info.apply_patch_tool_type.is_some()
@@ -847,7 +863,10 @@ fn append_extension_tool_executors(
         .iter()
         .map(|executor| executor.tool_name())
         .collect::<HashSet<_>>();
-    if code_mode_enabled(turn_context) {
+    if matches!(
+        turn_context.tool_mode,
+        ToolMode::CodeMode | ToolMode::CodeModeOnly
+    ) {
         reserved_tool_names.insert(ToolName::plain(codex_code_mode::PUBLIC_TOOL_NAME));
         reserved_tool_names.insert(ToolName::plain(codex_code_mode::WAIT_TOOL_NAME));
     }
@@ -919,6 +938,10 @@ impl ToolExecutor<ToolInvocation> for MultiAgentV2NamespaceOverride {
         self.handler.supports_parallel_tool_calls()
     }
 
+    fn search_info(&self) -> Option<ToolSearchInfo> {
+        self.handler.search_info()
+    }
+
     async fn handle(
         &self,
         invocation: ToolInvocation,
@@ -930,10 +953,6 @@ impl ToolExecutor<ToolInvocation> for MultiAgentV2NamespaceOverride {
 impl CoreToolRuntime for MultiAgentV2NamespaceOverride {
     fn matches_kind(&self, payload: &crate::tools::context::ToolPayload) -> bool {
         self.handler.matches_kind(payload)
-    }
-
-    fn search_info(&self) -> Option<crate::tools::tool_search_entry::ToolSearchInfo> {
-        self.handler.search_info()
     }
 
     fn create_diff_consumer(

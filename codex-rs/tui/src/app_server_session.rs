@@ -49,6 +49,8 @@ use codex_app_server_protocol::SkillsListResponse;
 use codex_app_server_protocol::Thread;
 use codex_app_server_protocol::ThreadApproveGuardianDeniedActionParams;
 use codex_app_server_protocol::ThreadApproveGuardianDeniedActionResponse;
+use codex_app_server_protocol::ThreadArchiveParams;
+use codex_app_server_protocol::ThreadArchiveResponse;
 use codex_app_server_protocol::ThreadBackgroundTerminalsCleanParams;
 use codex_app_server_protocol::ThreadBackgroundTerminalsCleanResponse;
 use codex_app_server_protocol::ThreadCompactStartParams;
@@ -98,6 +100,8 @@ use codex_app_server_protocol::ThreadSource;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
 use codex_app_server_protocol::ThreadStartSource;
+use codex_app_server_protocol::ThreadUnarchiveParams;
+use codex_app_server_protocol::ThreadUnarchiveResponse;
 use codex_app_server_protocol::ThreadUnsubscribeParams;
 use codex_app_server_protocol::ThreadUnsubscribeResponse;
 use codex_app_server_protocol::Turn;
@@ -568,6 +572,36 @@ impl AppServerSession {
             })
             .await
             .wrap_err("thread/read failed during TUI session lookup")?;
+        Ok(response.thread)
+    }
+
+    pub(crate) async fn thread_archive(&mut self, thread_id: ThreadId) -> Result<()> {
+        let request_id = self.next_request_id();
+        let _: ThreadArchiveResponse = self
+            .client
+            .request_typed(ClientRequest::ThreadArchive {
+                request_id,
+                params: ThreadArchiveParams {
+                    thread_id: thread_id.to_string(),
+                },
+            })
+            .await
+            .wrap_err("failed to archive session")?;
+        Ok(())
+    }
+
+    pub(crate) async fn thread_unarchive(&mut self, thread_id: ThreadId) -> Result<Thread> {
+        let request_id = self.next_request_id();
+        let response: ThreadUnarchiveResponse = self
+            .client
+            .request_typed(ClientRequest::ThreadUnarchive {
+                request_id,
+                params: ThreadUnarchiveParams {
+                    thread_id: thread_id.to_string(),
+                },
+            })
+            .await
+            .wrap_err("failed to unarchive session")?;
         Ok(response.thread)
     }
 
@@ -1391,7 +1425,6 @@ fn thread_start_params_from_config(
         ephemeral: Some(config.ephemeral),
         session_start_source,
         thread_source: Some(ThreadSource::User),
-        persist_extended_history: false,
         ..ThreadStartParams::default()
     }
 }
@@ -1430,7 +1463,6 @@ fn thread_resume_params_from_config(
         sandbox,
         permissions,
         config: config_request_overrides_from_config(&config),
-        persist_extended_history: false,
         ..ThreadResumeParams::default()
     }
 }
@@ -1473,7 +1505,6 @@ fn thread_fork_params_from_config(
         developer_instructions: config.developer_instructions.clone(),
         ephemeral: config.ephemeral,
         thread_source: Some(ThreadSource::User),
-        persist_extended_history: false,
         ..ThreadForkParams::default()
     }
 }
@@ -2252,6 +2283,7 @@ mod tests {
                 id: thread_id.to_string(),
                 session_id: ThreadId::new().to_string(),
                 forked_from_id: Some(forked_from_id.to_string()),
+                parent_thread_id: None,
                 preview: "hello".to_string(),
                 ephemeral: false,
                 model_provider: "openai".to_string(),
