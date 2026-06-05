@@ -1783,12 +1783,13 @@ async fn run_accounts_command(cmd: AccountsCommand) -> anyhow::Result<()> {
     let store = AccountsStore::new(config.codex_home.to_path_buf());
     store.import_active_auth_if_missing(config.cli_auth_credentials_store_mode)?;
     let show_loading = std::io::stdout().is_terminal() && std::io::stderr().is_terminal();
-    refresh_account_limits_for_display(&config, &store, show_loading).await;
+    let limit_snapshots = refresh_account_limits_for_display(&config, &store, show_loading).await;
 
     let accounts_index = store.load()?;
     let rows = display_rows(
         &accounts_index.accounts,
         accounts_index.active_account_id.as_ref(),
+        &limit_snapshots,
         chrono::Utc::now(),
     );
     if rows.is_empty() {
@@ -1866,11 +1867,10 @@ async fn refresh_account_limits_for_display(
     config: &codex_core::config::Config,
     store: &AccountsStore,
     show_loading: bool,
-) {
+) -> codex_login::auth::multi_account::AccountLimitSnapshots {
     let chatgpt_base_url = config.chatgpt_base_url.clone();
-    store
+    let snapshots = store
         .refresh_account_limits_for_display(
-            config.cli_auth_credentials_store_mode,
             move |auth| {
                 let chatgpt_base_url = chatgpt_base_url.clone();
                 async move {
@@ -1899,6 +1899,7 @@ async fn refresh_account_limits_for_display(
     if show_loading {
         eprintln!();
     }
+    snapshots
 }
 
 fn print_accounts_loading_progress(loaded: usize, total: usize) {

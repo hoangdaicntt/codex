@@ -27,6 +27,7 @@ use codex_app_server_protocol::RateLimitSnapshot;
 use codex_app_server_protocol::SkillsListResponse;
 use codex_app_server_protocol::ThreadGoalStatus;
 use codex_file_search::FileMatch;
+use codex_login::auth::multi_account::AccountLimitSnapshots;
 use codex_login::auth::multi_account::AccountsIndex;
 use codex_protocol::ThreadId;
 use codex_protocol::openai_models::ModelPreset;
@@ -265,7 +266,7 @@ pub(crate) enum AppEvent {
 
     /// Result of loading saved accounts for the `/accounts` picker.
     AccountsPickerLoaded {
-        result: Result<AccountsIndex, String>,
+        result: Result<(AccountsIndex, AccountLimitSnapshots), String>,
     },
 
     /// Result of deleting an account from the `/accounts` picker.

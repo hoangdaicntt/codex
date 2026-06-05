@@ -10,9 +10,10 @@ use chrono::DateTime;
 use chrono::Utc;
 use codex_config::types::AuthCredentialsStoreMode;
 use codex_protocol::account::PlanType as AccountPlanType;
-use codex_protocol::protocol::RateLimitSnapshot;
 use serde::Deserialize;
+use serde::Deserializer;
 use serde::Serialize;
+use serde::Serializer;
 
 use crate::auth::AuthDotJson;
 use crate::auth::load_auth_dot_json;
@@ -20,8 +21,6 @@ use crate::auth::logout;
 use crate::auth::save_auth;
 
 use super::metadata::AccountMetadata;
-use super::selection;
-use super::selection::SelectionReason;
 
 const ACCOUNTS_JSON_VERSION: u32 = 1;
 
@@ -71,72 +70,81 @@ impl Default for AccountsIndex {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Clone, Debug, PartialEq)]
 pub struct StoredAccount {
     pub account_id: AccountId,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub email: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan_type: Option<AccountPlanType>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_id: Option<String>,
-    #[serde(default = "Utc::now")]
     pub created_at: DateTime<Utc>,
     pub last_used_at: DateTime<Utc>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_limit_state: Option<StoredLimitState>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_rate_limits: Option<StoredRateLimitSnapshot>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_auth_failure: Option<StoredAuthFailureState>,
     pub auth: AuthDotJson,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub enum StoredAuthFailureKind {
-    RefreshFailed,
+struct StoredAccountWire {
+    pub account_id: Option<AccountId>,
+    #[serde(default)]
+    pub email: Option<String>,
+    #[serde(default)]
+    pub plan_type: Option<AccountPlanType>,
+    #[serde(default)]
+    pub workspace_id: Option<String>,
+    #[serde(default)]
+    pub created_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub last_used_at: Option<DateTime<Utc>>,
+    pub auth: AuthDotJson,
 }
 
-#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+#[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct StoredAuthFailureState {
-    pub kind: StoredAuthFailureKind,
-    pub recorded_at: DateTime<Utc>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub message: Option<String>,
+struct StoredAccountSnapshot<'a> {
+    auth: &'a AuthDotJson,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub enum StoredLimitKind {
-    NearLimit,
-    Exhausted,
-}
-
-#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct StoredLimitState {
-    pub kind: StoredLimitKind,
-    pub recorded_at: DateTime<Utc>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub resets_at: Option<DateTime<Utc>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub snapshot: Option<RateLimitSnapshot>,
-}
-
-impl StoredLimitState {
-    pub fn is_active(&self, now: DateTime<Utc>) -> bool {
-        self.resets_at.is_none_or(|resets_at| resets_at > now)
+impl Serialize for StoredAccount {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        StoredAccountSnapshot { auth: &self.auth }.serialize(serializer)
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct StoredRateLimitSnapshot {
-    pub recorded_at: DateTime<Utc>,
-    pub snapshot: RateLimitSnapshot,
+impl<'de> Deserialize<'de> for StoredAccount {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = StoredAccountWire::deserialize(deserializer)?;
+        let now = Utc::now();
+        let metadata = AccountMetadata::from_auth(&wire.auth);
+        let account_id = metadata
+            .as_ref()
+            .map(|metadata| AccountId(metadata.account_id.clone()))
+            .or(wire.account_id)
+            .ok_or_else(|| serde::de::Error::custom("stored account is missing account id"))?;
+        Ok(Self {
+            account_id,
+            email: metadata
+                .as_ref()
+                .and_then(|metadata| metadata.email.clone())
+                .or(wire.email),
+            plan_type: metadata
+                .as_ref()
+                .and_then(|metadata| metadata.plan_type)
+                .or(wire.plan_type),
+            workspace_id: metadata
+                .as_ref()
+                .and_then(|metadata| metadata.workspace_id.clone())
+                .or(wire.workspace_id),
+            created_at: wire.created_at.unwrap_or(now),
+            last_used_at: wire.last_used_at.unwrap_or(now),
+            auth: wire.auth,
+        })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -357,7 +365,6 @@ impl AccountsStore {
             ));
         };
         account.auth = auth.clone();
-        account.last_auth_failure = None;
         self.save(&index)?;
         if active_account_id.as_ref() == Some(account_id) {
             save_active_auth_json(&self.codex_home, &auth, auth_credentials_store_mode)?;
@@ -365,162 +372,41 @@ impl AccountsStore {
         Ok(())
     }
 
-    pub fn mark_account_rate_limits(
+    pub fn next_saved_account(
         &self,
-        account_id: &AccountId,
-        snapshot: RateLimitSnapshot,
-    ) -> std::io::Result<()> {
-        let mut index = self.load()?;
-        let Some(account) = index
-            .accounts
-            .iter_mut()
-            .find(|account| &account.account_id == account_id)
-        else {
-            return Ok(());
-        };
-        let now = Utc::now();
-        let limit_state = selection::limit_state_from_snapshot(snapshot.clone(), now);
-        account.last_rate_limits = Some(StoredRateLimitSnapshot {
-            recorded_at: now,
-            snapshot,
-        });
-        account.last_limit_state = limit_state;
-        self.save(&index)
-    }
-
-    pub fn active_limit_kind(
-        &self,
-        now: DateTime<Utc>,
-    ) -> std::io::Result<Option<StoredLimitKind>> {
-        let index = self.load()?;
-        let Some(active_account_id) = index.active_account_id.as_ref() else {
-            return Ok(None);
-        };
-        Ok(index
-            .accounts
-            .iter()
-            .find(|account| &account.account_id == active_account_id)
-            .and_then(|account| selection::account_limit_kind_for_switch(account, now)))
-    }
-
-    pub fn mark_active_from_snapshot(
-        &self,
-        snapshot: RateLimitSnapshot,
-    ) -> std::io::Result<Option<StoredLimitKind>> {
-        let mut index = self.load()?;
-        let Some(active_account_id) = index.active_account_id.clone() else {
-            return Ok(None);
-        };
-        let Some(account) = index
-            .accounts
-            .iter_mut()
-            .find(|account| account.account_id == active_account_id)
-        else {
-            return Ok(None);
-        };
-        let now = Utc::now();
-        let Some(limit_state) = selection::limit_state_from_snapshot(snapshot, now) else {
-            account.last_limit_state = None;
-            self.save(&index)?;
-            return Ok(None);
-        };
-        let kind = limit_state.kind;
-        account.last_limit_state = Some(limit_state);
-        self.save(&index)?;
-        Ok(Some(kind))
-    }
-
-    pub fn mark_active_exhausted(&self, resets_at: Option<DateTime<Utc>>) -> std::io::Result<()> {
-        let mut index = self.load()?;
-        let Some(active_account_id) = index.active_account_id.clone() else {
-            return Ok(());
-        };
-        let Some(account) = index
-            .accounts
-            .iter_mut()
-            .find(|account| account.account_id == active_account_id)
-        else {
-            return Ok(());
-        };
-        account.last_limit_state = Some(StoredLimitState {
-            kind: StoredLimitKind::Exhausted,
-            recorded_at: Utc::now(),
-            resets_at,
-            snapshot: None,
-        });
-        self.save(&index)
-    }
-
-    pub fn mark_active_exhausted_from_snapshot(
-        &self,
-        snapshot: RateLimitSnapshot,
-        fallback_resets_at: Option<DateTime<Utc>>,
-    ) -> std::io::Result<()> {
-        let mut index = self.load()?;
-        let Some(active_account_id) = index.active_account_id.clone() else {
-            return Ok(());
-        };
-        let Some(account) = index
-            .accounts
-            .iter_mut()
-            .find(|account| account.account_id == active_account_id)
-        else {
-            return Ok(());
-        };
-        account.last_limit_state = Some(StoredLimitState {
-            kind: StoredLimitKind::Exhausted,
-            recorded_at: Utc::now(),
-            resets_at: selection::snapshot_reset_time(&snapshot).or(fallback_resets_at),
-            snapshot: Some(snapshot),
-        });
-        self.save(&index)
-    }
-
-    pub fn mark_active_refresh_failed(&self, message: Option<String>) -> std::io::Result<()> {
-        let index = self.load()?;
-        let Some(active_account_id) = index.active_account_id.clone() else {
-            return Ok(());
-        };
-        self.mark_account_refresh_failed(&active_account_id, message)
-    }
-
-    pub fn mark_account_refresh_failed(
-        &self,
-        account_id: &AccountId,
-        message: Option<String>,
-    ) -> std::io::Result<()> {
-        let mut index = self.load()?;
-        let Some(account) = index
-            .accounts
-            .iter_mut()
-            .find(|account| &account.account_id == account_id)
-        else {
-            return Ok(());
-        };
-        account.last_auth_failure = Some(StoredAuthFailureState {
-            kind: StoredAuthFailureKind::RefreshFailed,
-            recorded_at: Utc::now(),
-            message,
-        });
-        self.save(&index)
-    }
-
-    pub fn next_available_account(
-        &self,
-        reason: SelectionReason,
+        skipped_account_ids: &[String],
         forced_workspace_ids: Option<&[String]>,
     ) -> std::io::Result<Option<AccountId>> {
         let index = self.load()?;
         let Some(active_account_id) = index.active_account_id.as_ref() else {
             return Ok(None);
         };
-        Ok(selection::select_next_available_account(
-            &index,
-            active_account_id,
-            reason,
-            forced_workspace_ids,
-            Utc::now(),
-        ))
+        let Some(active_index) = index
+            .accounts
+            .iter()
+            .position(|account| &account.account_id == active_account_id)
+        else {
+            return Ok(None);
+        };
+        Ok(index
+            .accounts
+            .iter()
+            .cycle()
+            .skip(active_index + 1)
+            .take(index.accounts.len().saturating_sub(1))
+            .find(|account| {
+                !skipped_account_ids
+                    .iter()
+                    .any(|skipped| skipped == account.account_id.as_str())
+                    && forced_workspace_ids.is_none_or(|expected| {
+                        account
+                            .workspace_id
+                            .as_ref()
+                            .is_some_and(|workspace_id| expected.contains(workspace_id))
+                    })
+                    && AccountMetadata::from_auth(&account.auth).is_some()
+            })
+            .map(|account| account.account_id.clone()))
     }
 }
 
@@ -546,7 +432,6 @@ fn upsert_auth(
         account.plan_type = metadata.plan_type;
         account.workspace_id = metadata.workspace_id;
         account.last_used_at = now;
-        account.last_auth_failure = None;
         account.auth = auth;
     } else {
         index.accounts.push(StoredAccount {
@@ -556,9 +441,6 @@ fn upsert_auth(
             workspace_id: metadata.workspace_id,
             created_at: now,
             last_used_at: now,
-            last_limit_state: None,
-            last_rate_limits: None,
-            last_auth_failure: None,
             auth,
         });
     }

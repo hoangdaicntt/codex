@@ -69,6 +69,7 @@ use codex_analytics::InvocationType;
 use codex_analytics::TurnResolvedConfigFact;
 use codex_analytics::build_track_events_context;
 use codex_async_utils::OrCancelExt;
+use codex_core_skills::injection::InjectedHostSkillPrompts;
 use codex_extension_api::TurnInputContext;
 use codex_extension_api::TurnInputEnvironment;
 use codex_features::Feature;
@@ -535,6 +536,9 @@ async fn build_skills_and_plugins(
     )
     .await;
 
+    let injected_host_skill_prompts = turn_context
+        .extension_data
+        .get::<InjectedHostSkillPrompts>();
     let SkillInjections {
         items: skill_injections,
         warnings: skill_warnings,
@@ -591,7 +595,16 @@ async fn build_skills_and_plugins(
             .track_plugin_used(tracking.clone(), plugin);
     }
 
-    let mut injection_items = skill_items;
+    let mut injection_items: Vec<ResponseItem> = match injected_host_skill_prompts {
+        Some(injected_host_skill_prompts) => skill_injections
+            .iter()
+            .filter(|skill| !injected_host_skill_prompts.contains_path(&skill.path))
+            .map(|skill| {
+                ContextualUserFragment::into(crate::context::SkillInstructions::from(skill))
+            })
+            .collect(),
+        None => skill_items,
+    };
     injection_items.extend(plugin_items);
     injection_items.extend(extension_injection_items);
     Some((injection_items, explicitly_enabled_connectors))
@@ -685,7 +698,7 @@ async fn track_turn_resolved_config_analytics(
             permission_profile: turn_context.permission_profile(),
             #[allow(deprecated)]
             permission_profile_cwd: turn_context.cwd.to_path_buf(),
-            reasoning_effort: turn_context.reasoning_effort,
+            reasoning_effort: turn_context.reasoning_effort.clone(),
             reasoning_summary: Some(turn_context.reasoning_summary),
             service_tier: turn_context
                 .config
@@ -1012,23 +1025,8 @@ async fn run_sampling_request(
     let max_retries = turn_context.provider.info().stream_max_retries();
     let mut retries = 0;
     let mut initial_input = Some(input);
+    let mut failed_account_ids = Vec::new();
     loop {
-        if let Some(account_id) =
-            maybe_switch_auth_failed_account_for_next_request(&sess, &turn_context).await
-        {
-            *client_session = sess.services.model_client.new_session();
-            let account = account_display_label(&sess, &account_id);
-            info!(
-                "switched active account before sampling request after auth failure: {account}"
-            );
-        }
-        if let Some(account_id) =
-            maybe_switch_limited_account_for_next_request(&sess, &turn_context).await
-        {
-            *client_session = sess.services.model_client.new_session();
-            let account = account_display_label(&sess, &account_id);
-            info!("switched active account before sampling request: {account}");
-        }
         let prompt_input = if let Some(input) = initial_input.take() {
             input
         } else {
@@ -1068,24 +1066,14 @@ async fn run_sampling_request(
                     rate_limits.rate_limit_reached_type = e.rate_limit_reached_type;
                     sess.update_rate_limits(&turn_context, rate_limits.clone())
                         .await;
-                    if let Err(err) = sess
-                        .services
-                        .auth_manager
-                        .mark_active_account_exhausted_from_snapshot(rate_limits, e.resets_at)
-                    {
-                        warn!(
-                            "failed to mark active account exhausted from rate limit snapshot: {err}"
-                        );
-                    }
-                } else if let Err(err) = sess
-                    .services
-                    .auth_manager
-                    .mark_active_account_exhausted(e.resets_at)
-                {
-                    warn!("failed to mark active account exhausted after usage limit: {err}");
                 }
-                if let Some(account_id) =
-                    maybe_switch_limited_account_for_next_request(&sess, &turn_context).await
+                if let Some(account_id) = maybe_switch_account_for_retry(
+                    &sess,
+                    &turn_context,
+                    &mut failed_account_ids,
+                    "because the previous account reached its usage limit.",
+                )
+                .await
                 {
                     *client_session = sess.services.model_client.new_session();
                     let account = account_display_label(&sess, &account_id);
@@ -1098,8 +1086,13 @@ async fn run_sampling_request(
                 return Err(CodexErr::UsageLimitReached(e));
             }
             Err(CodexErr::RefreshTokenFailed(e)) => {
-                if let Some(account_id) =
-                    maybe_switch_auth_failed_account_for_next_request(&sess, &turn_context).await
+                if let Some(account_id) = maybe_switch_account_for_retry(
+                    &sess,
+                    &turn_context,
+                    &mut failed_account_ids,
+                    "because the previous account could not refresh its token.",
+                )
+                .await
                 {
                     *client_session = sess.services.model_client.new_session();
                     let account = account_display_label(&sess, &account_id);
@@ -1131,45 +1124,23 @@ async fn run_sampling_request(
     }
 }
 
-async fn maybe_switch_limited_account_for_next_request(
+async fn maybe_switch_account_for_retry(
     sess: &Session,
     turn_context: &TurnContext,
+    failed_account_ids: &mut Vec<String>,
+    reason: &str,
 ) -> Option<String> {
-    match sess
-        .services
-        .auth_manager
-        .switch_if_active_account_limited()
-        .await
+    if let Some(active_account_id) = sess.services.auth_manager.active_account_id()
+        && !failed_account_ids
+            .iter()
+            .any(|account_id| account_id == &active_account_id)
     {
-        Ok(Some(account_id)) => {
-            let account = account_display_label(sess, &account_id);
-            sess.send_event(
-                turn_context,
-                EventMsg::Warning(WarningEvent {
-                    message: format!(
-                        "Switched active ChatGPT account to {account} for the next request because the previous account is near or at its usage limit."
-                    ),
-                }),
-            )
-            .await;
-            Some(account_id)
-        }
-        Ok(None) => None,
-        Err(err) => {
-            warn!("failed to switch active account after rate-limit state changed: {err}");
-            None
-        }
+        failed_account_ids.push(active_account_id);
     }
-}
-
-async fn maybe_switch_auth_failed_account_for_next_request(
-    sess: &Session,
-    turn_context: &TurnContext,
-) -> Option<String> {
     match sess
         .services
         .auth_manager
-        .switch_if_active_account_auth_failed()
+        .switch_to_next_saved_account(failed_account_ids)
         .await
     {
         Ok(Some(account_id)) => {
@@ -1178,7 +1149,7 @@ async fn maybe_switch_auth_failed_account_for_next_request(
                 turn_context,
                 EventMsg::Warning(WarningEvent {
                     message: format!(
-                        "Switched active ChatGPT account to {account} and retrying because the previous account could not refresh its token."
+                        "Switched active ChatGPT account to {account} and retrying {reason}"
                     ),
                 }),
             )
@@ -1187,7 +1158,7 @@ async fn maybe_switch_auth_failed_account_for_next_request(
         }
         Ok(None) => None,
         Err(err) => {
-            warn!("failed to switch active account after auth refresh failure: {err}");
+            warn!("failed to switch active account for retry: {err}");
             None
         }
     }
@@ -1915,7 +1886,7 @@ async fn try_run_sampling_request(
             prompt,
             &turn_context.model_info,
             &turn_context.session_telemetry,
-            turn_context.reasoning_effort,
+            turn_context.reasoning_effort.clone(),
             turn_context.reasoning_summary,
             turn_context.config.service_tier.clone(),
             turn_metadata_header,
@@ -1943,7 +1914,6 @@ async fn try_run_sampling_request(
         !sess.services.extensions.turn_item_contributors().is_empty();
     let mut active_item_is_streaming_to_client = false;
     let receiving_span = trace_span!("receiving_stream");
-    let mut completed_response_id: Option<String> = None;
     let outcome: CodexResult<SamplingRequestResult> = loop {
         let handle_responses = trace_span!(
             parent: &receiving_span,
@@ -2179,13 +2149,6 @@ async fn try_run_sampling_request(
             ResponseEvent::RateLimits(snapshot) => {
                 // Update internal state with latest rate limits, but defer sending until
                 // token usage is available to avoid duplicate TokenCount events.
-                if let Err(err) = sess
-                    .services
-                    .auth_manager
-                    .mark_active_account_limited(snapshot.clone())
-                {
-                    warn!("failed to record active account rate-limit state: {err}");
-                }
                 sess.record_rate_limits_info(snapshot).await;
                 should_emit_token_count = true;
             }
@@ -2194,9 +2157,9 @@ async fn try_run_sampling_request(
                 sess.services.models_manager.refresh_if_new_etag(etag).await;
             }
             ResponseEvent::Completed {
-                response_id,
                 token_usage,
                 end_turn,
+                ..
             } => {
                 flush_assistant_text_segments_all(
                     &sess,
@@ -2212,7 +2175,6 @@ async fn try_run_sampling_request(
                 if let Some(false) = end_turn {
                     needs_follow_up = true;
                 }
-                completed_response_id = Some(response_id);
                 break Ok(SamplingRequestResult {
                     needs_follow_up,
                     last_agent_message,
@@ -2335,15 +2297,6 @@ async fn try_run_sampling_request(
         &mut assistant_message_stream_parsers,
     )
     .await;
-
-    if sess
-        .features
-        .enabled(Feature::ResponsesWebsocketResponseProcessed)
-        && outcome.is_ok()
-        && let Some(response_id) = completed_response_id.as_deref()
-    {
-        client_session.send_response_processed(response_id).await;
-    }
 
     drain_in_flight(&mut in_flight, sess.clone(), turn_context.clone()).await?;
 

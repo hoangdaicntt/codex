@@ -5,6 +5,7 @@ use crate::bottom_pane::SelectionRowDisplay;
 use codex_backend_client::Client as BackendClient;
 use codex_login::AuthManager;
 use codex_login::auth::multi_account::AccountId;
+use codex_login::auth::multi_account::AccountLimitSnapshots;
 use codex_login::auth::multi_account::AccountsIndex;
 use codex_login::auth::multi_account::AccountsStore;
 use codex_login::auth::multi_account::account_id_at_index;
@@ -68,17 +69,23 @@ impl ChatWidget {
         true
     }
 
-    pub(crate) fn show_accounts_picker(&mut self, index: AccountsIndex) {
-        self.show_accounts_picker_with_selection(index, None);
+    pub(crate) fn show_accounts_picker(
+        &mut self,
+        index: AccountsIndex,
+        limit_snapshots: AccountLimitSnapshots,
+    ) {
+        self.show_accounts_picker_with_selection(index, limit_snapshots, None);
     }
 
     pub(crate) fn show_accounts_picker_with_selection(
         &mut self,
         index: AccountsIndex,
+        limit_snapshots: AccountLimitSnapshots,
         selected_idx: Option<usize>,
     ) {
         let params = account_selection_params(
             index,
+            &limit_snapshots,
             selected_idx,
             accounts_picker_footer_hint(),
         );
@@ -147,26 +154,26 @@ fn accounts_loading_params(progress: Option<(usize, usize)>) -> SelectionViewPar
 async fn load_accounts_picker_index(
     config: Config,
     tx: crate::app_event_sender::AppEventSender,
-) -> Result<AccountsIndex, String> {
+) -> Result<(AccountsIndex, AccountLimitSnapshots), String> {
     let store = AccountsStore::new(config.codex_home.to_path_buf());
     store
         .import_active_auth_if_missing(config.cli_auth_credentials_store_mode)
         .map_err(|err| format!("Failed to load saved accounts: {err}"))?;
-    refresh_account_limits_for_display(&config, &store, Some(&tx)).await;
-    store
+    let limit_snapshots = refresh_account_limits_for_display(&config, &store, Some(&tx)).await;
+    let index = store
         .load()
-        .map_err(|err| format!("Failed to load saved accounts: {err}"))
+        .map_err(|err| format!("Failed to load saved accounts: {err}"))?;
+    Ok((index, limit_snapshots))
 }
 
 async fn refresh_account_limits_for_display(
     config: &Config,
     store: &AccountsStore,
     tx: Option<&crate::app_event_sender::AppEventSender>,
-) {
+) -> AccountLimitSnapshots {
     let chatgpt_base_url = config.chatgpt_base_url.clone();
     store
         .refresh_account_limits_for_display(
-            config.cli_auth_credentials_store_mode,
             move |auth| {
                 let chatgpt_base_url = chatgpt_base_url.clone();
                 async move {
@@ -187,7 +194,7 @@ async fn refresh_account_limits_for_display(
             },
             |loaded, total| send_accounts_picker_progress(tx, loaded, total),
         )
-        .await;
+        .await
 }
 
 fn send_accounts_picker_progress(
@@ -202,12 +209,14 @@ fn send_accounts_picker_progress(
 
 fn account_selection_params(
     index: AccountsIndex,
+    limit_snapshots: &AccountLimitSnapshots,
     selected_idx: Option<usize>,
     footer_hint: Line<'static>,
 ) -> SelectionViewParams {
     let rows = display_rows(
         &index.accounts,
         index.active_account_id.as_ref(),
+        limit_snapshots,
         chrono::Utc::now(),
     );
     let initial_selected_idx = selected_idx
@@ -381,9 +390,6 @@ mod tests {
             workspace_id: None,
             created_at: Utc.with_ymd_and_hms(2026, 5, 28, 3, 30, 0).unwrap(),
             last_used_at: Utc::now(),
-            last_limit_state: None,
-            last_rate_limits: None,
-            last_auth_failure: None,
             auth: AuthDotJson {
                 auth_mode: Some(AuthMode::Chatgpt),
                 openai_api_key: None,
@@ -398,12 +404,17 @@ mod tests {
             accounts: vec![account],
         };
 
-        let params = account_selection_params(index, None, accounts_picker_footer_hint());
+        let params = account_selection_params(
+            index,
+            &AccountLimitSnapshots::new(),
+            None,
+            accounts_picker_footer_hint(),
+        );
 
         assert_eq!(params.items.len(), 1);
         assert!(params.items[0].name.contains("* 1. a@example.com"));
-        assert!(params.items[0].name.contains("5h -"));
-        assert!(params.items[0].name.contains("Week -"));
+        assert!(params.items[0].name.contains("5h unknown"));
+        assert!(params.items[0].name.contains("Week unknown"));
         assert!(params.items[0].name.contains("token exp -"));
         assert_eq!(
             params.footer_hint,
