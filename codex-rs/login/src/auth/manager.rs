@@ -1,5 +1,4 @@
 use async_trait::async_trait;
-use chrono::DateTime;
 use chrono::Utc;
 use reqwest::StatusCode;
 use serde::Deserialize;
@@ -24,16 +23,14 @@ use codex_app_server_protocol::AuthMode;
 use codex_app_server_protocol::AuthMode as ApiAuthMode;
 use codex_protocol::config_types::ForcedLoginMethod;
 use codex_protocol::config_types::ModelProviderAuthInfo;
-use codex_protocol::protocol::RateLimitSnapshot;
 
 use super::external_bearer::BearerTokenRefresher;
 use super::multi_account::AccountDisplayRow;
 use super::multi_account::AccountId;
+use super::multi_account::AccountLimitSnapshots;
 use super::multi_account::AccountsIndex;
 use super::multi_account::AccountsStore;
-use super::multi_account::SelectionReason;
 use super::multi_account::StoredAccount;
-use super::multi_account::StoredLimitKind;
 use super::multi_account::account_display_label;
 use super::multi_account::account_id_at_index;
 use super::multi_account::display_rows;
@@ -1439,6 +1436,7 @@ impl AuthManager {
         Ok(display_rows(
             &index.accounts,
             index.active_account_id.as_ref(),
+            &AccountLimitSnapshots::new(),
             Utc::now(),
         ))
     }
@@ -1448,8 +1446,26 @@ impl AuthManager {
             .sync_active_auth_json(self.auth_credentials_store_mode)
     }
 
+    fn flush_cached_auth_to_accounts(&self, store: &AccountsStore) -> std::io::Result<()> {
+        let Some(auth) = self
+            .auth_cached()
+            .and_then(|auth| auth.get_current_auth_json())
+        else {
+            return Ok(());
+        };
+        if super::multi_account::AccountMetadata::from_auth(&auth).is_some() {
+            store.upsert_active_auth(auth)?;
+        }
+        Ok(())
+    }
+
     pub async fn switch_account(&self, account_id: &str) -> std::io::Result<bool> {
-        let changed = AccountsStore::new(self.codex_home.clone()).switch_active_account(
+        let _switch_guard = self.refresh_lock.acquire().await.map_err(|_| {
+            std::io::Error::other("failed to acquire auth switch lock")
+        })?;
+        let store = AccountsStore::new(self.codex_home.clone());
+        self.flush_cached_auth_to_accounts(&store)?;
+        let changed = store.switch_active_account(
             &AccountId::from(account_id),
             self.auth_credentials_store_mode,
         )?;
@@ -1463,37 +1479,18 @@ impl AuthManager {
         self.switch_account(account_id.as_str()).await
     }
 
-    pub fn mark_active_account_limited(
+    pub async fn switch_to_next_saved_account(
         &self,
-        snapshot: RateLimitSnapshot,
-    ) -> std::io::Result<Option<StoredLimitKind>> {
-        AccountsStore::new(self.codex_home.clone()).mark_active_from_snapshot(snapshot)
-    }
-
-    pub fn mark_active_account_exhausted(
-        &self,
-        resets_at: Option<DateTime<Utc>>,
-    ) -> std::io::Result<()> {
-        AccountsStore::new(self.codex_home.clone()).mark_active_exhausted(resets_at)
-    }
-
-    pub fn mark_active_account_exhausted_from_snapshot(
-        &self,
-        snapshot: RateLimitSnapshot,
-        fallback_resets_at: Option<DateTime<Utc>>,
-    ) -> std::io::Result<()> {
-        AccountsStore::new(self.codex_home.clone())
-            .mark_active_exhausted_from_snapshot(snapshot, fallback_resets_at)
-    }
-
-    pub async fn switch_to_next_available_account(
-        &self,
-        reason: SelectionReason,
+        skipped_account_ids: &[String],
     ) -> std::io::Result<Option<String>> {
+        let _switch_guard = self.refresh_lock.acquire().await.map_err(|_| {
+            std::io::Error::other("failed to acquire auth switch lock")
+        })?;
         let store = AccountsStore::new(self.codex_home.clone());
+        self.flush_cached_auth_to_accounts(&store)?;
         let forced_workspace_ids = self.forced_chatgpt_workspace_id();
         let Some(next_account_id) =
-            store.next_available_account(reason, forced_workspace_ids.as_deref())?
+            store.next_saved_account(skipped_account_ids, forced_workspace_ids.as_deref())?
         else {
             return Ok(None);
         };
@@ -1508,36 +1505,6 @@ impl AuthManager {
             &index.accounts,
             &AccountId::from(account_id),
         ))
-    }
-
-    pub async fn switch_if_active_account_limited(&self) -> std::io::Result<Option<String>> {
-        let store = AccountsStore::new(self.codex_home.clone());
-        let Some(kind) = store.active_limit_kind(Utc::now())? else {
-            return Ok(None);
-        };
-        let reason = match kind {
-            StoredLimitKind::NearLimit => SelectionReason::ProactiveNearLimit,
-            StoredLimitKind::Exhausted => SelectionReason::UsageLimitReached,
-        };
-        self.switch_to_next_available_account(reason).await
-    }
-
-    pub async fn switch_if_active_account_auth_failed(&self) -> std::io::Result<Option<String>> {
-        let store = AccountsStore::new(self.codex_home.clone());
-        let index = store.load()?;
-        let Some(active_account_id) = index.active_account_id.as_ref() else {
-            return Ok(None);
-        };
-        let active_account_has_auth_failure = index
-            .accounts
-            .iter()
-            .find(|account| &account.account_id == active_account_id)
-            .is_some_and(|account| account.last_auth_failure.is_some());
-        if !active_account_has_auth_failure {
-            return Ok(None);
-        }
-        self.switch_to_next_available_account(SelectionReason::AuthFailure)
-            .await
     }
 
     /// Subscribes to cached auth changes that can affect request recovery.
@@ -1652,7 +1619,7 @@ impl AuthManager {
         attempted_auth: &CodexAuth,
         error: &RefreshTokenFailedError,
     ) {
-        let should_mark_active = if let Ok(mut guard) = self.inner.write() {
+        if let Ok(mut guard) = self.inner.write() {
             let current_auth_matches =
                 Self::auths_equal_for_refresh(Some(attempted_auth), guard.auth.as_ref());
             if current_auth_matches {
@@ -1661,16 +1628,6 @@ impl AuthManager {
                     error: error.clone(),
                 });
             }
-            current_auth_matches
-        } else {
-            false
-        };
-
-        if should_mark_active
-            && let Err(err) = AccountsStore::new(self.codex_home.clone())
-                .mark_active_refresh_failed(Some(error.to_string()))
-        {
-            tracing::warn!("failed to mark active account refresh failure: {err}");
         }
     }
 

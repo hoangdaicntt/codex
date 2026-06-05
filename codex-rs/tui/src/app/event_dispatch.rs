@@ -357,7 +357,7 @@ impl App {
                 self.chat_widget.update_accounts_picker_loading(loaded, total);
             }
             AppEvent::AccountsPickerLoaded { result } => match result {
-                Ok(index) if index.accounts.is_empty() => {
+                Ok((index, _)) if index.accounts.is_empty() => {
                     if self.chat_widget.dismiss_accounts_picker() {
                         self.chat_widget.add_info_message(
                             "No saved ChatGPT accounts.".to_string(),
@@ -365,7 +365,10 @@ impl App {
                         );
                     }
                 }
-                Ok(index) => self.chat_widget.show_accounts_picker(index),
+                Ok((index, limit_snapshots)) => {
+                    self.chat_widget
+                        .show_accounts_picker(index, limit_snapshots);
+                }
                 Err(err) => {
                     if self.chat_widget.dismiss_accounts_picker() {
                         self.chat_widget.add_error_message(err);
@@ -382,6 +385,7 @@ impl App {
                     self.chat_widget.add_info_message(result.message, /*hint*/ None);
                     self.chat_widget.show_accounts_picker_with_selection(
                         result.accounts_index,
+                        Default::default(),
                         result.selected_idx,
                     );
                 }
@@ -838,7 +842,7 @@ impl App {
                 self.chat_widget.on_connectors_loaded(result, is_final);
             }
             AppEvent::UpdateReasoningEffort(effort) => {
-                self.on_update_reasoning_effort(effort);
+                self.on_update_reasoning_effort(effort.clone());
                 self.sync_active_thread_reasoning_setting(app_server, effort)
                     .await;
             }
@@ -1388,19 +1392,23 @@ impl App {
             AppEvent::PersistModelSelection { model, effort } => {
                 match crate::config_update::write_config_batch(
                     app_server.request_handle(),
-                    crate::config_update::build_model_selection_edits(model.as_str(), effort),
+                    crate::config_update::build_model_selection_edits(
+                        model.as_str(),
+                        effort.as_ref(),
+                    ),
                 )
                 .await
                 {
                     Ok(_) => {
                         let effort_label = effort
-                            .map(|selected_effort| selected_effort.to_string())
+                            .as_ref()
+                            .map(std::string::ToString::to_string)
                             .unwrap_or_else(|| "default".to_string());
                         tracing::info!("Selected model: {model}, Selected effort: {effort_label}");
                         let mut message = format!("Model changed to {model}");
-                        if let Some(label) = Self::reasoning_label_for(&model, effort) {
+                        if let Some(label) = Self::reasoning_label_for(&model, effort.as_ref()) {
                             message.push(' ');
-                            message.push_str(label);
+                            message.push_str(&label);
                         }
                         self.chat_widget.add_info_message(message, /*hint*/ None);
                     }
@@ -1695,7 +1703,7 @@ impl App {
                 self.chat_widget.set_rate_limit_switch_prompt_hidden(hidden);
             }
             AppEvent::UpdatePlanModeReasoningEffort(effort) => {
-                self.config.plan_mode_reasoning_effort = effort;
+                self.config.plan_mode_reasoning_effort = effort.clone();
                 self.chat_widget.set_plan_mode_reasoning_effort(effort);
                 self.sync_active_thread_plan_mode_reasoning_setting(app_server)
                     .await;

@@ -4,22 +4,7 @@ use codex_protocol::protocol::RateLimitReachedType;
 use codex_protocol::protocol::RateLimitSnapshot;
 use codex_protocol::protocol::RateLimitWindow;
 
-use super::metadata::AccountMetadata;
-use super::store::AccountId;
-use super::store::AccountsIndex;
-use super::store::StoredAccount;
-use super::store::StoredLimitKind;
-use super::store::StoredLimitState;
-
 const NEAR_LIMIT_USED_PERCENT: f64 = 90.0;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SelectionReason {
-    AuthFailure,
-    ProactiveNearLimit,
-    UsageLimitReached,
-    Manual,
-}
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum LimitClassification {
@@ -45,104 +30,6 @@ pub fn classify_rate_limit_snapshot(snapshot: &RateLimitSnapshot) -> LimitClassi
     }
 
     LimitClassification::Available
-}
-
-pub(crate) fn limit_state_from_snapshot(
-    snapshot: RateLimitSnapshot,
-    recorded_at: DateTime<Utc>,
-) -> Option<StoredLimitState> {
-    let classification = classify_rate_limit_snapshot(&snapshot);
-    match classification {
-        LimitClassification::Available => None,
-        LimitClassification::NearLimit { resets_at } => Some(StoredLimitState {
-            kind: StoredLimitKind::NearLimit,
-            recorded_at,
-            resets_at,
-            snapshot: Some(snapshot),
-        }),
-        LimitClassification::Exhausted { resets_at } => Some(StoredLimitState {
-            kind: StoredLimitKind::Exhausted,
-            recorded_at,
-            resets_at,
-            snapshot: Some(snapshot),
-        }),
-    }
-}
-
-pub(crate) fn select_next_available_account(
-    index: &AccountsIndex,
-    active_account_id: &AccountId,
-    reason: SelectionReason,
-    forced_workspace_ids: Option<&[String]>,
-    now: DateTime<Utc>,
-) -> Option<AccountId> {
-    let active_index = index
-        .accounts
-        .iter()
-        .position(|account| &account.account_id == active_account_id)?;
-    index
-        .accounts
-        .iter()
-        .cycle()
-        .skip(active_index + 1)
-        .take(index.accounts.len().saturating_sub(1))
-        .find(|account| account_is_eligible(account, reason, forced_workspace_ids, now))
-        .map(|account| account.account_id.clone())
-}
-
-fn account_is_eligible(
-    account: &StoredAccount,
-    reason: SelectionReason,
-    forced_workspace_ids: Option<&[String]>,
-    now: DateTime<Utc>,
-) -> bool {
-    if let Some(expected) = forced_workspace_ids
-        && !account
-            .workspace_id
-            .as_ref()
-            .is_some_and(|workspace_id| expected.contains(workspace_id))
-    {
-        return false;
-    }
-
-    if AccountMetadata::from_auth(&account.auth).is_none() {
-        return false;
-    }
-
-    if account.last_auth_failure.is_some() {
-        return false;
-    }
-
-    if matches!(
-        reason,
-        SelectionReason::AuthFailure
-            | SelectionReason::ProactiveNearLimit
-            | SelectionReason::UsageLimitReached
-    ) && account_limit_kind_for_switch(account, now).is_some()
-    {
-        return false;
-    }
-
-    true
-}
-
-pub(crate) fn account_limit_kind_for_switch(
-    account: &StoredAccount,
-    now: DateTime<Utc>,
-) -> Option<StoredLimitKind> {
-    let state = account.last_limit_state.as_ref()?;
-    if !state.is_active(now) {
-        return None;
-    }
-    match state.kind {
-        StoredLimitKind::Exhausted => Some(StoredLimitKind::Exhausted),
-        StoredLimitKind::NearLimit => state
-            .snapshot
-            .as_ref()
-            .and_then(|snapshot| {
-                window_is_near_limit(snapshot.primary.as_ref()).then_some(state.kind)
-            }),
-    }
 }
 
 pub fn preferred_account_limit_snapshot(

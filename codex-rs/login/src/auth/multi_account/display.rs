@@ -7,6 +7,7 @@ use crate::token_data::parse_jwt_expiration;
 
 use super::store::AccountId;
 use super::store::StoredAccount;
+use super::token_refresh::AccountLimitSnapshots;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AccountDisplayRow {
@@ -19,12 +20,21 @@ pub struct AccountDisplayRow {
 pub fn display_rows(
     accounts: &[StoredAccount],
     active_account_id: Option<&AccountId>,
+    limit_snapshots: &AccountLimitSnapshots,
     now: DateTime<Utc>,
 ) -> Vec<AccountDisplayRow> {
     accounts
         .iter()
         .enumerate()
-        .map(|(offset, account)| display_row(offset + 1, account, active_account_id, now))
+        .map(|(offset, account)| {
+            display_row(
+                offset + 1,
+                account,
+                active_account_id,
+                limit_snapshots,
+                now,
+            )
+        })
         .collect()
 }
 
@@ -61,6 +71,7 @@ fn display_row(
     index: usize,
     account: &StoredAccount,
     active_account_id: Option<&AccountId>,
+    limit_snapshots: &AccountLimitSnapshots,
     now: DateTime<Utc>,
 ) -> AccountDisplayRow {
     let is_active = active_account_id == Some(&account.account_id);
@@ -69,15 +80,12 @@ fn display_row(
     let last_used = format_compact_elapsed(account.last_used_at, now);
     let token_exp = token_exp_display(account, now);
     let created_at = format_created_at(account.created_at);
-    let detail = if account.last_auth_failure.is_some() {
-        format!("   auth failed · used {last_used} · token exp {token_exp} · {created_at}")
-    } else {
-        let five_hour = limit_display(account, LimitWindowKind::FiveHour, now);
-        let week = limit_display(account, LimitWindowKind::Week, now);
-        format!(
-            "   5h {five_hour} · Week {week} · used {last_used} · token exp {token_exp} · {created_at}"
-        )
-    };
+    let snapshot = limit_snapshots.get(&account.account_id);
+    let five_hour = limit_display(snapshot, LimitWindowKind::FiveHour, now);
+    let week = limit_display(snapshot, LimitWindowKind::Week, now);
+    let detail = format!(
+        "   5h {five_hour} · Week {week} · used {last_used} · token exp {token_exp} · {created_at}"
+    );
     let line = format!("{marker}{index}. {email}\n{detail}");
 
     AccountDisplayRow {
@@ -94,19 +102,13 @@ enum LimitWindowKind {
     Week,
 }
 
-fn limit_display(account: &StoredAccount, kind: LimitWindowKind, now: DateTime<Utc>) -> String {
-    let Some(snapshot) = account
-        .last_rate_limits
-        .as_ref()
-        .map(|stored| &stored.snapshot)
-        .or_else(|| {
-            account
-                .last_limit_state
-                .as_ref()
-                .and_then(|state| state.snapshot.as_ref())
-        })
-    else {
-        return "-".to_string();
+fn limit_display(
+    snapshot: Option<&codex_protocol::protocol::RateLimitSnapshot>,
+    kind: LimitWindowKind,
+    now: DateTime<Utc>,
+) -> String {
+    let Some(snapshot) = snapshot else {
+        return "unknown".to_string();
     };
 
     let window = match kind {
@@ -116,7 +118,7 @@ fn limit_display(account: &StoredAccount, kind: LimitWindowKind, now: DateTime<U
 
     window
         .map(|window| format_window(window, now))
-        .unwrap_or_else(|| "-".to_string())
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 fn format_window(window: &RateLimitWindow, now: DateTime<Utc>) -> String {
